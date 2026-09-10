@@ -345,7 +345,6 @@ python-pptx==1.0.2
 python-slugify==8.0.4
 python_speech_features==0.6
 pytz==2025.2
-pywin32==312
 PyXB-X==1.2.6.3
 PyYAML==6.0.3
 qrcode==8.2
