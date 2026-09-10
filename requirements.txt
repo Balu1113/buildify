@@ -311,7 +311,7 @@ pyexcel-xls==0.7.1
 Pygments==2.19.2
 pyHanko==0.32.0
 pyhanko-certvalidator==0.29.0
-PyJWT==2.10.0
+PyJWT==2.10.1
 pylibsrtp==1.0.0
 PyMCubes==0.1.6
 pymupdf==1.28.0
