@@ -361,7 +361,7 @@ requests-oauthlib==2.0.0
 requests-toolbelt==1.0.0
 resampy==0.4.3
 rich==14.2.0
-rjsmin==1.2.0
+rjsmin==1.2.4
 rlPyCairo==0.4.0
 rpds-py==2026.6.3
 rsa==4.9.1
