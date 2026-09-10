@@ -350,8 +350,6 @@ pywin32==312
 PyXB-X==1.2.6.3
 PyYAML==6.0.3
 qrcode==8.2
-# Editable install with no version control (Rag_proj==0.1.0)
--e c:\users\balaji.talati\desktop\agentic-ai-course\rag_proj
 rank-bm25==0.2.2
 RapidFuzz==3.14.5
 rcssmin==1.1.0
@@ -449,8 +447,6 @@ websocket-client==1.9.0
 websockets==15.0.1
 Werkzeug==3.1.4
 whitenoise==6.3.0
-# Editable install with no version control (workflow-engine==0.1.0)
--e c:\users\balaji.talati\desktop\digi_emp\digital_employee_backend\backend\workflow-engine
 wrapt==2.2.2
 xhtml2pdf==0.2.17
 xlrd==2.0.2
