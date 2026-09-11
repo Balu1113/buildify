@@ -11,23 +11,102 @@ const STAGES = ["planning", "developing", "testing", "debugging", "reviewing", "
 const STAGE_ICONS = { planning: "📋", developing: "🔨", testing: "🧪", debugging: "🐛", reviewing: "👁️", completed: "✨", failed: "❌" };
 const FILE_ICONS = { py: "🐍", js: "📜", jsx: "⚛️", ts: "📘", html: "🌐", css: "🎨", json: "📋", txt: "📄", md: "📝", tsx: "⚛️" };
 const AI_MODELS = [
-  { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
-  { value: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite" },
-  { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-  { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
-  { value: "gemini-3-flash", label: "Gemini 3 Flash" },
-  { value: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash Lite" },
-  { value: "gemini-3.5-flash", label: "Gemini 3.5 Flash" },
-  { value: "gemini-3.6-flash", label: "Gemini 3.6 Flash" },
-  { value: "gemini-3.7-flash", label: "Gemini 3.7 Flash" },
-  { value: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
-  { value: "gemma-4-26b", label: "Gemma 4 26B" },
-  { value: "gemma-4-31b", label: "Gemma 4 31B" },
-  { value: "llama-3.3-70b-versatile", label: "Groq - Llama 3.3 70B" },
-  { value: "llama-4-scout-17b-16e-instruct", label: "Groq - Llama 4 Scout" },
-  { value: "qwen/qwen3-32b", label: "Groq - Qwen 3 32B" },
-  { value: "deepseek-ai/deepseek-v4-pro-0813", label: "DeepSeek V4 Pro" },
+  {
+    provider: "Google",
+    models: [
+      { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+      { value: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite" },
+      { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+      { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
+      { value: "gemini-3-flash", label: "Gemini 3 Flash" },
+      { value: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash Lite" },
+      { value: "gemini-3.5-flash", label: "Gemini 3.5 Flash" },
+      { value: "gemini-3.6-flash", label: "Gemini 3.6 Flash" },
+      { value: "gemini-3.7-flash", label: "Gemini 3.7 Flash" },
+      { value: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+      { value: "gemma-4-26b", label: "Gemma 4 26B" },
+      { value: "gemma-4-31b", label: "Gemma 4 31B" },
+    ],
+  },
+  {
+    provider: "Groq",
+    models: [
+      { value: "openai/gpt-oss-120b", label: "GPT OSS 120B" },
+      { value: "openai/gpt-oss-20b", label: "GPT OSS 20B (Fast)" },
+    ],
+  },
+  {
+    provider: "OpenRouter",
+    models: [
+      { value: "deepseek/deepseek-chat-v3.1", label: "DeepSeek Chat V3.1" },
+      { value: "nex-agi/nex-n2.5-pro:free", label: "Nex AGI N2.5 Pro (Free)" },
+      { value: "google/gemini-2.5-flash", label: "Google Gemini 2.5 Flash" },
+      { value: "openai/gpt-4.1-mini", label: "OpenAI GPT-4.1 Mini" },
+      { value: "meta-llama/llama-3.3-70b-instruct", label: "Meta Llama 3.3 70B Instruct" },
+      { value: "mistralai/mistral-small-3.1-24b-instruct", label: "Mistral Small 3.1 24B Instruct" },
+      { value: "poolside/poolside-laguna-s-2.1", label: "Poolside Laguna S 2.1" },
+      { value: "poolside/poolside-laguna-xs-2.1", label: "Poolside Laguna XS 2.1" },
+      { value: "cohere/north-mini-code", label: "Cohere North Mini Code" },
+      { value: "dots3/dots3-note", label: "Dots3-Note" },
+      { value: "thinking-machines/inkling", label: "Thinking Machines Inkling" },
+    ],
+  },
 ];
+
+const ModelProviderSelector = ({ value, onChange, disabled = false }) => {
+  const selectedGroup = AI_MODELS.find((group) => group.models.some((model) => model.value === value)) || AI_MODELS[0];
+  const [selectedProvider, setSelectedProvider] = useState(selectedGroup.provider);
+
+  useEffect(() => {
+    const matchedGroup = AI_MODELS.find((group) => group.models.some((model) => model.value === value)) || AI_MODELS[0];
+    setSelectedProvider(matchedGroup.provider);
+  }, [value]);
+
+  const activeGroup = AI_MODELS.find((group) => group.provider === selectedProvider) || AI_MODELS[0];
+  const activeOptions = activeGroup.models;
+  const selectedModel = activeOptions.some((model) => model.value === value) ? value : activeOptions[0]?.value;
+
+  useEffect(() => {
+    if (!disabled && selectedModel !== value) {
+      onChange(selectedModel);
+    }
+  }, [selectedModel, value, disabled, onChange]);
+
+  const handleProviderChange = (nextProvider) => {
+    const nextGroup = AI_MODELS.find((group) => group.provider === nextProvider) || AI_MODELS[0];
+    const nextModel = nextGroup.models[0]?.value;
+    setSelectedProvider(nextProvider);
+    if (nextModel) onChange(nextModel);
+  };
+
+  return (
+    <div style={{ display: "grid", gap: 8 }}>
+      <select
+        className="input"
+        value={selectedProvider}
+        onChange={(e) => handleProviderChange(e.target.value)}
+        disabled={disabled}
+        aria-label="AI provider"
+      >
+        {AI_MODELS.map((group) => (
+          <option key={group.provider} value={group.provider}>{group.provider}</option>
+        ))}
+      </select>
+
+      <select
+        className="input"
+        value={selectedModel}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        aria-label="AI model"
+      >
+        {activeOptions.map((model) => (
+          <option key={model.value} value={model.value}>{model.label}</option>
+        ))}
+      </select>
+    </div>
+  );
+};
 
 const getLang = (path) => {
   const ext = path.split(".").pop();
@@ -121,8 +200,8 @@ const FileTree = ({ tree, selectedFile, onSelect, depth = 0 }) => {
 
 const ProjectList = () => {
   const [projects, setProjects] = useState([]);
-  const [formData, setFormData] = useState({ name: "", description: "", ai_model: "deepseek-ai/deepseek-v4-pro-0813" });
-  const [selectedAiModel, setSelectedAiModel] = useState("deepseek-ai/deepseek-v4-pro-0813");
+  const [formData, setFormData] = useState({ name: "", description: "", ai_model: "deepseek/deepseek-chat-v3.1" });
+  const [selectedAiModel, setSelectedAiModel] = useState("deepseek/deepseek-chat-v3.1");
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState(null);
   const [selectedProject, setSelectedProject] = useState(null);
@@ -199,19 +278,19 @@ const ProjectList = () => {
   };
 
   const handleSelect = async (p) => {
-    setSelectedProject(p.id); setSelectedAiModel(p.ai_model || "deepseek-ai/deepseek-v4-pro-0813"); setSelectedFile(null); setFileContent(""); setRunInfo(null); setFileTab("view"); setModifyHistory([]);
+    setSelectedProject(p.id); setSelectedAiModel(p.ai_model || "deepseek/deepseek-chat-v3.1"); setSelectedFile(null); setFileContent(""); setRunInfo(null); setFileTab("view"); setModifyHistory([]);
     setRunState({ status: "idle", port: null });
     if (runPollRef.current) { clearInterval(runPollRef.current); runPollRef.current = null; }
     await fetchTasks(p.id); const pi = await fetchPipeline(p.id); setPipeline(pi);
     if (pi) await fetchFiles(p.id);
     if (pi && pi.stage !== "completed" && pi.stage !== "failed") { startPolling(p.id); setLoading(true); }
   };
-  const handleModelChange = async (e) => {
-    const ai_model = e.target.value;
+  const handleModelChange = async (value) => {
+    const ai_model = value;
     setSelectedAiModel(ai_model);
     if (!selectedProject) return;
     try {
-      await projectAPI.update(selectedProject, { ai_model });
+      await projectAPI.patch(selectedProject, { ai_model });
       showToast("AI model updated. It applies to the next pipeline run.", "info");
     } catch {
       showToast("Unable to update the AI model.", "error");
@@ -336,7 +415,7 @@ const ProjectList = () => {
           <div className="grid-2">
             <div className="form-group"><label className="form-label">Name</label><input className="input" name="name" placeholder="My Awesome App" value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })} required /></div>
             <div className="form-group"><label className="form-label">Description</label><textarea className="textarea" name="description" placeholder="Build a todo app with auth, categories, and a dashboard..." value={formData.description} onChange={(e) => setFormData({ ...formData, description: e.target.value })} rows={2} required /></div>
-            <div className="form-group"><label className="form-label">AI model</label><select className="input" value={formData.ai_model} onChange={(e) => setFormData({ ...formData, ai_model: e.target.value })}>{AI_MODELS.map((model) => <option key={model.value} value={model.value}>{model.label}</option>)}</select></div>
+            <div className="form-group"><label className="form-label">AI model</label><ModelProviderSelector value={formData.ai_model} onChange={(value) => setFormData({ ...formData, ai_model: value })} /></div>
           </div>
           <button type="submit" disabled={loading} className="btn btn-primary btn-lg" style={{ marginTop: 4 }}>
             {loading ? <><div className="spinner" /> Building...</> : "✨ Create & Build with AI"}
@@ -370,9 +449,9 @@ const ProjectList = () => {
                 <div className="card-header">
                   <div className="card-title">Build Pipeline</div>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <select className="input" value={selectedAiModel} onChange={handleModelChange} disabled={pipeline.stage !== "completed" && pipeline.stage !== "failed"} style={{ width: 210, padding: "6px 8px", fontSize: 11 }} aria-label="AI model">
-                      {AI_MODELS.map((model) => <option key={model.value} value={model.value}>{model.label}</option>)}
-                    </select>
+                    <div style={{ width: 240 }}>
+                      <ModelProviderSelector value={selectedAiModel} onChange={handleModelChange} disabled={pipeline.stage !== "completed" && pipeline.stage !== "failed"} />
+                    </div>
                     <span className={`badge badge-${pipeline.stage}`}>{STAGE_ICONS[pipeline.stage]} {pipeline.stage}</span>
                     {pipeline.stage !== "completed" && pipeline.stage !== "failed" ? (
                       <button onClick={handleStopPipeline} disabled={!loading} className="btn btn-danger btn-sm">

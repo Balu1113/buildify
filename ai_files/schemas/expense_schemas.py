@@ -1,9 +1,9 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime
 from typing import Optional
 
 class ExpenseBase(BaseModel):
-    amount: float
+    amount: float = Field(..., gt=0)
     description: str
     category_id: int
     ai_label: Optional[str] = None

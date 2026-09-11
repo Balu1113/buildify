@@ -94,6 +94,14 @@ def get_monthly_summary(db: Session = Depends(get_db)):
     
     return [{"category_id": row[0], "total": row[1]} for row in summary]
 
+
+@router.get("/expenses/{expense_id}", response_model=Expense)
+def read_expense(expense_id: int, db: Session = Depends(get_db)):
+    db_expense = db.query(ExpenseModel).filter(ExpenseModel.id == expense_id).first()
+    if not db_expense:
+        raise HTTPException(status_code=404, detail="Expense not found")
+    return db_expense
+
 @router.post("/expenses/upload")
 async def upload_receipt(file: UploadFile = File(...), db: Session = Depends(get_db)):
 

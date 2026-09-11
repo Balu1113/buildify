@@ -22,6 +22,17 @@ TestingSessionLocal = sessionmaker(
 )
 
 
+def override_get_db():
+    db = TestingSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+app.dependency_overrides[get_db] = override_get_db
+
+
 @pytest.fixture(autouse=True)
 def setup_db():
     Base.metadata.create_all(bind=engine)
@@ -31,18 +42,7 @@ def setup_db():
 
 @pytest.fixture
 def client():
-    def override_get_db():
-        db = TestingSessionLocal()
-        try:
-            yield db
-        finally:
-            db.close()
-
-    app.dependency_overrides[get_db] = override_get_db
-
     from fastapi.testclient import TestClient
 
     with TestClient(app) as test_client:
         yield test_client
-
-    app.dependency_overrides.clear()

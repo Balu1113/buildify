@@ -7,6 +7,8 @@ import time
 import threading
 import traceback
 import subprocess
+import shutil
+import hashlib
 
 from django.conf import settings
 
@@ -30,8 +32,31 @@ if not OPENAI_API_KEY:
         pass
 
 OPENAI_BASE_URL = "https://integrate.api.nvidia.com/v1"
-OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "deepseek-ai/deepseek-v4-pro-0813")
+OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "nex-agi/nex-n2.5-pro:free")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    try:
+        with open(ROOT_ENV_PATH, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("OPENROUTER_API_KEY="):
+                    OPENROUTER_API_KEY = line.split("=", 1)[1].strip('"').strip("'")
+                    break
+    except Exception:
+        pass
+LEGACY_MODEL_ALIASES = {
+    "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
+    "llama-4-scout-17b-16e-instruct": "openai/gpt-oss-120b",
+    "qwen/qwen3-32b": "openai/gpt-oss-120b",
+    "moonshotai/kimi-k2-instruct": "openai/gpt-oss-120b",
+    "meta-llama/llama-4-maverick-17b-128e-instruct": "openai/gpt-oss-120b",
+    "nvidia/nemotron-3-ultra": "nex-agi/nex-n2.5-pro:free",
+    "nvidia/llama-3.1-nemotron-70b-instruct": "nex-agi/nex-n2.5-pro:free",
+    "deepseek-ai/deepseek-v4-pro-0813": "nex-agi/nex-n2.5-pro:free",
+    "deepseek/deepseek-chat-v3.1": "nex-agi/nex-n2.5-pro:free",
+}
 
 _client = None
 
@@ -49,22 +74,40 @@ def get_openai_client():
     return _client
 
 
+def _is_openrouter_model(model_name: str) -> bool:
+    model_name = model_name.strip()
+    if not model_name or model_name.startswith(("gemini-", "gemma-")):
+        return False
+    if model_name in {"openai/gpt-oss-120b", "openai/gpt-oss-20b"}:
+        return False
+    return "/" in model_name
+
+
 def generate_response(prompt: str, model_name=None) -> str:
-    """Generate response using OpenAI API."""
+    """Generate response using the selected model provider."""
     try:
         model_name = model_name or OPENAI_MODEL_NAME
+        model_name = LEGACY_MODEL_ALIASES.get(model_name, model_name)
         if model_name.startswith(("gemini-", "gemma-")):
             from google import genai
             client = genai.Client(api_key=settings.GEMINI_API_KEY)
             return client.models.generate_content(model=model_name, contents=prompt).text
         if model_name in {
-            "llama-3.3-70b-versatile",
-            "llama-4-scout-17b-16e-instruct",
-            "qwen/qwen3-32b",
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
         }:
             client = OpenAI(
                 base_url=GROQ_BASE_URL,
                 api_key=os.getenv("GROQ_API_KEY"),
+                timeout=180.0,
+                max_retries=2,
+            )
+        elif _is_openrouter_model(model_name):
+            if not OPENROUTER_API_KEY:
+                raise ValueError("OPENROUTER_API_KEY is not set in the environment.")
+            client = OpenAI(
+                base_url=OPENROUTER_BASE_URL,
+                api_key=OPENROUTER_API_KEY,
                 timeout=180.0,
                 max_retries=2,
             )
@@ -77,8 +120,7 @@ def generate_response(prompt: str, model_name=None) -> str:
             top_p=0.95,
             max_tokens=8192,
             seed=42,
-            extra_body={"chat_template_kwargs": {"thinking": False}},
-            stream=False
+            stream=False,
         )
         return completion.choices[0].message.content
     except Exception as e:
@@ -90,10 +132,10 @@ from tasks.models import Task
 from projects.models import Project
 
 
-MAX_RETRIES = 2
+# Stop after a small, bounded set of attempts so the user can switch models and retry.
+MAX_RETRIES = 5
 MAX_FILE_CONTENT = 8000
-
-
+PROJECT_EXCLUDED_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
 class PipelineStopped(Exception):
     """Raised when a user stops a running pipeline."""
 
@@ -102,6 +144,34 @@ def _raise_if_pipeline_stopped(pipeline):
     pipeline.refresh_from_db(fields=["stage"])
     if pipeline.stage == PipelineRun.Stage.FAILED:
         raise PipelineStopped()
+
+
+def _load_project_files(project_dir):
+    """Hydrate the agent context from the generated project on disk."""
+    files = {}
+    if not os.path.isdir(project_dir):
+        return files
+    for root, dirs, filenames in os.walk(project_dir):
+        dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
+        for filename in filenames:
+            path = os.path.join(root, filename)
+            relative = os.path.relpath(path, project_dir).replace(os.sep, "/")
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    files[relative] = handle.read()
+            except (UnicodeDecodeError, OSError):
+                continue
+    return files
+
+
+def _project_python(project_dir):
+    """Return the project-local Python, creating its environment on demand."""
+    venv_dir = os.path.join(project_dir, ".venv")
+    python_name = "Scripts\\python.exe" if os.name == "nt" else "bin/python"
+    executable = os.path.join(venv_dir, python_name)
+    if not os.path.exists(executable):
+        subprocess.run([sys.executable, "-m", "venv", venv_dir], check=True, timeout=180)
+    return executable
 
 # Helper functions for AST parsing and file tree building
 def extract_python_symbols(source_code: str) -> dict:
@@ -209,7 +279,7 @@ def verify_file_content(filepath: str, content: str) -> dict:
     """Verify a generated file. Returns dict with valid, errors, warnings."""
     result = {"valid": True, "errors": [], "warnings": []}
 
-    if not content or not content.strip():
+    if not content.strip() and not filepath.replace("\\", "/").endswith("/__init__.py"):
         result["valid"] = False
         result["errors"].append("Empty file content")
         return result
@@ -229,6 +299,60 @@ def verify_file_content(filepath: str, content: str) -> dict:
     return result
 
 
+def _validated_file_map(files, label):
+    """Reject malformed agent file maps before they enter project state."""
+    if files is None:
+        raise ValueError(f"{label} returned no file map")
+    if not isinstance(files, dict):
+        raise ValueError(f"{label} returned {type(files).__name__}, expected an object")
+    invalid = [path for path, content in files.items() if not isinstance(path, str) or not isinstance(content, str)]
+    if invalid:
+        raise ValueError(f"{label} returned non-string content for: {', '.join(map(str, invalid[:5]))}")
+    return files
+
+
+def _project_preflight(project_files):
+    """Find cheap, deterministic file failures before invoking an agent."""
+    failures = []
+    for filepath, content in project_files.items():
+        if not isinstance(content, str):
+            failures.append(f"{filepath}: content is not text")
+            continue
+        if filepath.endswith(".py"):
+            valid, error = validate_python_syntax(content)
+            if not valid:
+                failures.append(f"{filepath}: {error}")
+        elif filepath.endswith(".json"):
+            try:
+                json.loads(content)
+            except json.JSONDecodeError as error:
+                failures.append(f"{filepath}: invalid JSON at line {error.lineno}: {error.msg}")
+    return failures
+
+
+def _repair_workspace(task, project, project_files, project_dir, pipeline, diagnostics, model_name):
+    """Ask the Debugger to repair pipeline diagnostics and validate its patch."""
+    repair_result = _run_debugger(
+        task,
+        project,
+        project_files,
+        project_dir,
+        {"passed": False, "test_output": "Pipeline diagnostics:\n" + "\n".join(diagnostics)},
+        pipeline,
+        model_name=model_name,
+    )
+    if not repair_result.get("fixed", False):
+        return False
+    repair_files = _validated_file_map(repair_result.get("files", {}), "Debugger")
+    for filepath, content in repair_files.items():
+        verification = verify_file_content(filepath, content)
+        if not verification["valid"]:
+            raise ValueError(f"Debugger produced invalid {filepath}: {verification['errors']}")
+        project_files[filepath] = content
+        _write_file(project_dir, filepath, content)
+    return True
+
+
 def run_pipeline(project_id):
     thread = threading.Thread(target=_run_pipeline_worker, args=(project_id,), daemon=True)
     thread.start()
@@ -239,7 +363,9 @@ def _run_pipeline_worker(project_id):
     try:
         project = Project.objects.get(id=project_id)
         all_tasks = list(Task.objects.filter(project=project).order_by("id"))
-        selected_model = project.ai_model or OPENAI_MODEL_NAME
+        selected_model = Project.LEGACY_MODEL_ALIASES.get(
+            project.ai_model, project.ai_model
+        ) or OPENAI_MODEL_NAME
 
         pipeline = PipelineRun.objects.create(
             project=project,
@@ -250,10 +376,14 @@ def _run_pipeline_worker(project_id):
 
         pipeline.append_log(f"Pipeline started for project: {project.name}")
         pipeline.append_log(f"Description: {project.description}")
+        project_dir = os.path.join(PROJECT_ROOT, "generated_projects", f"project_{project.id}")
 
         # Planning belongs to the pipeline so the UI can show it and task creation
         # happens before the development stages begin.
         if not all_tasks:
+            if os.path.isdir(project_dir):
+                shutil.rmtree(project_dir, ignore_errors=True)
+                pipeline.append_log("[Workspace] Removed stale output before fresh planning")
             pipeline.append_log("[Planner] Creating an ordered implementation plan...")
             from ai_services.gemini_ai import plan_project
 
@@ -261,9 +391,11 @@ def _run_pipeline_worker(project_id):
                 f"{project.name}: {project.description or ''}",
                 model_name=selected_model,
             )
-            if not plan or not isinstance(plan.get("tasks"), list):
-                planner_error = plan.get("error", "unknown planner error") if plan else "empty planner response"
-                raise RuntimeError(f"Planner did not return a valid task plan: {planner_error}")
+            if not plan or not isinstance(plan.get("tasks"), list) or not plan["tasks"]:
+                planner_error = plan.get("error", "empty or invalid task plan") if plan else "empty planner response"
+                raise RuntimeError(
+                    f"Planner failed using selected model '{selected_model}': {planner_error}"
+                )
 
             for task_data in plan["tasks"]:
                 Task.objects.create(
@@ -278,18 +410,49 @@ def _run_pipeline_worker(project_id):
         else:
             pipeline.append_log(f"[Planner] Resuming existing plan with {len(all_tasks)} tasks")
 
+        pipeline.append_log(f"[Agents] Using selected model only: {selected_model}")
+
         tasks = [task for task in all_tasks if task.status != "done"]
         pipeline.total_tasks = len(tasks)
         pipeline.save(update_fields=["total_tasks"])
         pipeline.append_log(f"Total tasks to process: {len(tasks)}")
 
-        project_dir = os.path.join(PROJECT_ROOT, "generated_projects", f"project_{project.id}")
         os.makedirs(project_dir, exist_ok=True)
 
-        project_files = {}
+        project_files = _load_project_files(project_dir)
+        pipeline.append_log(
+            f"[Workspace] Hydrated {len(project_files)} existing files from generated project"
+        )
 
         for i, task in enumerate(tasks):
             _raise_if_pipeline_stopped(pipeline)
+            diagnostics = _project_preflight(project_files)
+            if diagnostics:
+                pipeline.stage = PipelineRun.Stage.DEBUGGING
+                pipeline.save(update_fields=["stage"])
+                pipeline.append_log(
+                    f"[Preflight] Found {len(diagnostics)} existing file failure(s) before task '{task.title}'"
+                )
+                for diagnostic in diagnostics[:10]:
+                    pipeline.append_log(f"[Preflight] {diagnostic}")
+                try:
+                    repaired = _repair_workspace(
+                        task, project, project_files, project_dir, pipeline,
+                        diagnostics, selected_model,
+                    )
+                    remaining = _project_preflight(project_files)
+                    if repaired and not remaining:
+                        pipeline.append_log("[Preflight] Debugger repaired all detected file failures")
+                    elif remaining:
+                        pipeline.append_log(
+                            f"[Preflight] {len(remaining)} failure(s) remain after repair"
+                        )
+                        pipeline.append_log("[Preflight] Blocking task processing until the workspace is repaired")
+                        task.status = "todo"
+                        task.save(update_fields=["status"])
+                        break
+                except Exception as error:
+                    pipeline.append_log(f"[Preflight] Repair error: {error}")
             task.status = "in_progress"
             task.save(update_fields=["status"])
             pipeline.current_task = task.title
@@ -323,7 +486,7 @@ def _run_pipeline_worker(project_id):
                         model_name=selected_model,
                     )
                     _raise_if_pipeline_stopped(pipeline)
-                    new_files = dev_result.get("files", {})
+                    new_files = _validated_file_map(dev_result.get("files"), "Developer")
                     pipeline.append_log(f"[Developer] Generated {len(new_files)} files")
 
                     # Verify and write files
@@ -347,6 +510,16 @@ def _run_pipeline_worker(project_id):
                     if verification_errors:
                         last_error = "Verification errors: " + "; ".join(verification_errors)
                         pipeline.append_log(f"[Developer] {last_error}")
+                        pipeline.stage = PipelineRun.Stage.DEBUGGING
+                        pipeline.save(update_fields=["stage"])
+                        pipeline.append_log("[Debugger] Repairing developer validation failures...")
+                        try:
+                            _repair_workspace(
+                                task, project, project_files, project_dir, pipeline,
+                                verification_errors, selected_model,
+                            )
+                        except Exception as repair_error:
+                            pipeline.append_log(f"[Debugger] Repair error: {repair_error}")
                         continue
 
                     # Validate imports for Python files
@@ -369,6 +542,16 @@ def _run_pipeline_worker(project_id):
                 except Exception as e:
                     last_error = f"Developer error: {e}"
                     pipeline.append_log(f"[Developer] Error: {e}")
+                    pipeline.stage = PipelineRun.Stage.DEBUGGING
+                    pipeline.save(update_fields=["stage"])
+                    pipeline.append_log("[Debugger] Repairing developer exception...")
+                    try:
+                        _repair_workspace(
+                            task, project, project_files, project_dir, pipeline,
+                            [last_error], selected_model,
+                        )
+                    except Exception as repair_error:
+                        pipeline.append_log(f"[Debugger] Repair error: {repair_error}")
                     continue
 
                 # TESTER
@@ -387,7 +570,8 @@ def _run_pipeline_worker(project_id):
                         f"[Tester] Tests {'PASSED' if test_passed else 'FAILED'}"
                     )
 
-                    for fname, content in test_result.get("test_files", {}).items():
+                    test_files = _validated_file_map(test_result.get("test_files", {}), "Tester")
+                    for fname, content in test_files.items():
                         project_files[fname] = content
                         _write_file(project_dir, fname, content)
 
@@ -395,6 +579,16 @@ def _run_pipeline_worker(project_id):
                     pipeline.append_log(f"[Tester] Error: {e}")
                     test_result = {"passed": False, "test_output": str(e)}
                     test_passed = False
+                    pipeline.stage = PipelineRun.Stage.DEBUGGING
+                    pipeline.save(update_fields=["stage"])
+                    pipeline.append_log("[Debugger] Repairing tester failure...")
+                    try:
+                        _repair_workspace(
+                            task, project, project_files, project_dir, pipeline,
+                            [f"Tester error: {e}"], selected_model,
+                        )
+                    except Exception as repair_error:
+                        pipeline.append_log(f"[Debugger] Repair error: {repair_error}")
 
                 # DEBUGGER (if tests failed)
                 if not test_passed:
@@ -411,7 +605,8 @@ def _run_pipeline_worker(project_id):
                         fixed = debug_result.get("fixed", False)
                         pipeline.append_log(f"[Debugger] Fix {'applied' if fixed else 'not applied'}")
 
-                        for fname, content in debug_result.get("files", {}).items():
+                        debug_files = _validated_file_map(debug_result.get("files", {}), "Debugger")
+                        for fname, content in debug_files.items():
                             project_files[fname] = content
                             _write_file(project_dir, fname, content)
 
@@ -456,6 +651,16 @@ def _run_pipeline_worker(project_id):
 
                 except Exception as e:
                     pipeline.append_log(f"[Reviewer] Error: {e}")
+                    pipeline.stage = PipelineRun.Stage.DEBUGGING
+                    pipeline.save(update_fields=["stage"])
+                    pipeline.append_log("[Debugger] Repairing reviewer/configuration failure...")
+                    try:
+                        _repair_workspace(
+                            task, project, project_files, project_dir, pipeline,
+                            [f"Reviewer error: {e}"], selected_model,
+                        )
+                    except Exception as repair_error:
+                        pipeline.append_log(f"[Debugger] Repair error: {repair_error}")
 
                 if test_passed and review_approved:
                     task_completed = True
@@ -472,7 +677,15 @@ def _run_pipeline_worker(project_id):
                 task.status = "done"
                 task.save(update_fields=["status"])
             else:
+                pipeline.stage = PipelineRun.Stage.FAILED
+                pipeline.error = (
+                    f"Task '{task.title}' failed after {MAX_RETRIES + 1} attempts with model '{selected_model}'. "
+                    "Please select another model and retry."
+                )
+                pipeline.save(update_fields=["stage", "error"])
                 pipeline.append_log(f"[Failed] Task '{task.title}' failed after {MAX_RETRIES + 1} attempts.")
+                pipeline.append_log(f"[Stopped] {pipeline.error}")
+                raise PipelineStopped()
 
             pipeline.completed_tasks = i + 1
             pipeline.save(update_fields=["completed_tasks"])
@@ -488,12 +701,6 @@ def _run_pipeline_worker(project_id):
         ).count()
 
         # Generate project-level files
-        pipeline.stage = (
-            PipelineRun.Stage.FAILED
-            if unfinished_tasks
-            else PipelineRun.Stage.COMPLETED
-        )
-        pipeline.save(update_fields=["stage"])
         pipeline.append_log("\n[Finalizing] Generating project metadata...")
 
         try:
@@ -501,10 +708,50 @@ def _run_pipeline_worker(project_id):
         except Exception as e:
             pipeline.append_log(f"[Finalize] README generation failed: {e}")
 
-        pipeline.append_log(f"\n{'='*60}")
-        if unfinished_tasks:
+        acceptance = _validate_project_locally(project_dir)
+        for check in acceptance["checks"]:
             pipeline.append_log(
-                f"PIPELINE FINISHED WITH {unfinished_tasks} UNFINISHED TASK(S)"
+                f"[Acceptance] {check['name']}: {'PASSED' if check['passed'] else 'FAILED'}"
+            )
+            if not check["passed"]:
+                pipeline.append_log(f"[Acceptance] {check['output'][-2000:]}")
+
+        if not acceptance["passed"] and all_tasks:
+            acceptance_diagnostics = [
+                f"{check['name']}: {check['output']}"
+                for check in acceptance["checks"]
+                if not check["passed"]
+            ]
+            pipeline.stage = PipelineRun.Stage.DEBUGGING
+            pipeline.save(update_fields=["stage"])
+            pipeline.append_log("[Debugger] Repairing final acceptance failures...")
+            try:
+                repaired = _repair_workspace(
+                    all_tasks[-1], project, project_files, project_dir, pipeline,
+                    acceptance_diagnostics, selected_model,
+                )
+                if repaired:
+                    acceptance = _validate_project_locally(project_dir)
+                    pipeline.append_log(
+                        f"[Acceptance] Re-run after repair: {'PASSED' if acceptance['passed'] else 'FAILED'}"
+                    )
+            except Exception as repair_error:
+                pipeline.append_log(f"[Debugger] Final repair error: {repair_error}")
+
+        acceptance_failed = not acceptance["passed"]
+        pipeline.stage = (
+            PipelineRun.Stage.FAILED
+            if unfinished_tasks or acceptance_failed
+            else PipelineRun.Stage.COMPLETED
+        )
+        if acceptance_failed:
+            pipeline.error = "Generated project failed local acceptance checks"
+        pipeline.save(update_fields=["stage", "error"])
+
+        pipeline.append_log(f"\n{'='*60}")
+        if unfinished_tasks or acceptance_failed:
+            pipeline.append_log(
+                "PIPELINE FINISHED WITHOUT ACCEPTANCE"
             )
         else:
             pipeline.append_log("PIPELINE COMPLETED SUCCESSFULLY")
@@ -515,8 +762,8 @@ def _run_pipeline_worker(project_id):
     except PipelineStopped:
         if pipeline:
             pipeline.stage = PipelineRun.Stage.FAILED
-            pipeline.error = "Pipeline stopped by user"
-            pipeline.append_log("\n[Stopped] Pipeline stopped by user.")
+            pipeline.error = pipeline.error or "Pipeline stopped by user"
+            pipeline.append_log(f"\n[Stopped] {pipeline.error}")
             pipeline.save(update_fields=["stage", "error"])
     except Exception as e:
         tb = traceback.format_exc()
@@ -819,14 +1066,18 @@ DJANGO TEST RULES (apply whenever the project uses Django):
    Example: from apps.calculator.models import Calculation
 """
 
+    generation_started = time.monotonic()
     response = generate_response(prompt, model_name=model_name)
+    pipeline.append_log(
+        f"[Tester] Model generation duration: {time.monotonic() - generation_started:.1f}s"
+    )
     result = _parse_json_response(response, "tester", model_name=model_name)
 
     if "error" in result:
         raise Exception(result["error"])
 
     # Write test files and run them
-    test_files = result.get("test_files", {})
+    test_files = _validated_file_map(result.get("test_files", {}), "Tester")
     if test_files and project_dir:
         for fname, content in test_files.items():
             _write_file(project_dir, fname, content)
@@ -879,7 +1130,10 @@ Description: {task.description}
 {test_output}
 
 === INSTRUCTIONS ===
-Analyze the test output and fix the source code to make tests pass.
+Analyze the diagnostics and fix the actual source, test, or project configuration
+failure. This may be a preflight scan before tests run. Inspect the complete file
+tree and repair malformed, missing, inconsistent, or incompatible files instead
+of only suppressing the reported error. Return complete replacement file contents.
 
 Common issues to check:
 1. Syntax errors in source or test files
@@ -1039,7 +1293,12 @@ def _write_file(project_dir, relative_path, content):
 def _execute_pytest(project_dir):
     """Run pytest and return results."""
     try:
+        started_at = time.monotonic()
+        project_python = _project_python(project_dir)
         env = os.environ.copy()
+        env["PIPELINE_LOCAL"] = "1"
+        env.setdefault("DATABASE_ENGINE", "sqlite3")
+        env.setdefault("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
         python_paths = [project_dir]
         backend_dir = os.path.join(project_dir, "backend")
         if os.path.isdir(backend_dir):
@@ -1065,29 +1324,45 @@ def _execute_pytest(project_dir):
         if os.path.isdir(backend_dir):
             requirements_files.append(os.path.join(backend_dir, "requirements.txt"))
 
+        install_time = 0.0
         for requirements in requirements_files:
             if not os.path.isfile(requirements):
                 continue
-            install = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-r", requirements, "-q"],
-                cwd=os.path.dirname(requirements),
-                capture_output=True,
-                text=True,
-                timeout=300,
-                env=env,
-            )
-            if install.returncode != 0:
-                return {"passed": False, "output": (install.stdout + "\n" + install.stderr).strip()}
+            with open(requirements, "rb") as requirements_file:
+                requirements_hash = hashlib.sha256(requirements_file.read()).hexdigest()
+            marker = os.path.join(project_dir, ".pipeline", "requirements", f"{hashlib.sha256(requirements.encode()).hexdigest()}.sha256")
+            cached_hash = None
+            if os.path.isfile(marker):
+                with open(marker, "r", encoding="ascii") as marker_file:
+                    cached_hash = marker_file.read().strip()
+            if cached_hash != requirements_hash:
+                install_started = time.monotonic()
+                install = subprocess.run(
+                    [project_python, "-m", "pip", "install", "-r", requirements, "-q"],
+                    cwd=os.path.dirname(requirements),
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    env=env,
+                )
+                if install.returncode != 0:
+                    return {"passed": False, "output": (install.stdout + "\n" + install.stderr).strip()}
+                os.makedirs(os.path.dirname(marker), exist_ok=True)
+                with open(marker, "w", encoding="ascii") as marker_file:
+                    marker_file.write(requirements_hash)
+                install_time = time.monotonic() - install_started
+            else:
+                install_time = 0.0
 
         plugin_check = subprocess.run(
-            [sys.executable, "-c", "import pytest_django"],
+            [project_python, "-c", "import pytest_django"],
             capture_output=True,
             text=True,
             env=env,
         )
         if plugin_check.returncode != 0 and os.path.isdir(backend_dir):
             install_plugin = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "pytest-django", "-q"],
+                [project_python, "-m", "pip", "install", "pytest-django", "-q"],
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -1095,7 +1370,7 @@ def _execute_pytest(project_dir):
             )
             if install_plugin.returncode != 0:
                 return {"passed": False, "output": (install_plugin.stdout + "\n" + install_plugin.stderr).strip()}
-        pytest_command = [sys.executable, "-m", "pytest", project_dir, "-x", "--tb=short", "-q"]
+        pytest_command = [project_python, "-m", "pytest", project_dir, "-x", "--tb=short", "-q"]
         if django_settings:
             # ``--ds`` takes precedence over a generated pytest.ini setting.
             # That keeps test execution isolated from a Docker/PostgreSQL
@@ -1111,11 +1386,94 @@ def _execute_pytest(project_dir):
             env=env,
         )
         output = proc.stdout + "\n" + proc.stderr
-        return {"passed": proc.returncode == 0, "output": output.strip()}
+        duration = time.monotonic() - started_at
+        return {
+            "passed": proc.returncode == 0,
+            "output": f"[pipeline] pytest duration: {duration:.1f}s; dependency install: {install_time:.1f}s\n{output.strip()}",
+        }
     except subprocess.TimeoutExpired:
         return {"passed": False, "output": "Test execution timed out after 120 seconds"}
     except Exception as e:
         return {"passed": False, "output": f"Test execution error: {e}"}
+
+
+def _validate_project_locally(project_dir):
+    """Run the generated app's own backend and frontend build gates."""
+    checks = []
+    env = os.environ.copy()
+    env["PIPELINE_LOCAL"] = "1"
+    env.setdefault("DATABASE_ENGINE", "sqlite3")
+    env.setdefault("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
+
+    manage_path = None
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
+        if "manage.py" in files:
+            manage_path = os.path.join(root, "manage.py")
+            break
+
+    if manage_path:
+        try:
+            python = _project_python(project_dir)
+            backend_dir = os.path.dirname(manage_path)
+            python_paths = [backend_dir, project_dir]
+            env["PYTHONPATH"] = os.pathsep.join(
+                python_paths + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+            )
+            python_files = []
+            for root, dirs, files in os.walk(backend_dir):
+                dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
+                python_files.extend(os.path.join(root, name) for name in files if name.endswith(".py"))
+            compile_result = subprocess.run(
+                [python, "-m", "py_compile", *python_files],
+                cwd=backend_dir, env=env, capture_output=True, text=True, timeout=180,
+            )
+            checks.append({"name": "Python compilation", "passed": compile_result.returncode == 0, "output": (compile_result.stdout + compile_result.stderr).strip()})
+            for name, command in (
+                ("Django system check", [python, manage_path, "check"]),
+                ("Django migrations", [python, manage_path, "migrate", "--noinput"]),
+                ("Django migration check", [python, manage_path, "makemigrations", "--check", "--dry-run"]),
+            ):
+                result = subprocess.run(
+                    command, cwd=backend_dir, env=env, capture_output=True,
+                    text=True, timeout=180,
+                )
+                checks.append({"name": name, "passed": result.returncode == 0, "output": (result.stdout + result.stderr).strip()})
+        except Exception as error:
+            checks.append({"name": "Django validation", "passed": False, "output": str(error)})
+
+    package_paths = []
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
+        if "package.json" in files:
+            package_paths.append(os.path.join(root, "package.json"))
+
+    npm = "npm.cmd" if os.name == "nt" else "npm"
+    for package_path in package_paths:
+        package_dir = os.path.dirname(package_path)
+        try:
+            lockfile = os.path.join(package_dir, "package-lock.json")
+            if not os.path.isfile(lockfile):
+                lock_result = subprocess.run([npm, "install", "--package-lock-only", "--ignore-scripts"], cwd=package_dir, env=env, capture_output=True, text=True, timeout=300)
+                if lock_result.returncode != 0:
+                    checks.append({"name": "Frontend lockfile generation", "passed": False, "output": (lock_result.stdout + lock_result.stderr).strip()})
+                    continue
+            install = subprocess.run([npm, "ci"], cwd=package_dir, env=env, capture_output=True, text=True, timeout=300)
+            if install.returncode != 0:
+                checks.append({"name": "Frontend dependency install", "passed": False, "output": (install.stdout + install.stderr).strip()})
+                continue
+            package = json.loads(open(package_path, encoding="utf-8").read())
+            if "build" not in package.get("scripts", {}):
+                checks.append({"name": "Frontend build", "passed": True, "output": "No build script declared"})
+                continue
+            build = subprocess.run([npm, "run", "build"], cwd=package_dir, env=env, capture_output=True, text=True, timeout=300)
+            checks.append({"name": "Frontend build", "passed": build.returncode == 0, "output": (build.stdout + build.stderr).strip()})
+        except Exception as error:
+            checks.append({"name": "Frontend validation", "passed": False, "output": str(error)})
+
+    if not checks:
+        checks.append({"name": "Project entrypoint", "passed": False, "output": "No Django manage.py or frontend package.json found"})
+    return {"passed": all(check["passed"] for check in checks), "checks": checks}
 
 
 def _find_generated_settings_module(project_dir, backend_dir):
@@ -1219,6 +1577,8 @@ Return ONLY the markdown content of the README. No JSON wrapping."""
 
 def _parse_json_response(response, agent_name, model_name=None):
     """Robustly parse JSON from LLM response."""
+    if not isinstance(response, str) or not response.strip():
+        return {"error": f"{agent_name} model response was empty"}
     text = response.strip()
 
     # Strip markdown code fences

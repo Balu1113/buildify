@@ -175,7 +175,11 @@ def _start_process(project_id, project_dir, script):
 
     scripts = [script]
     frontend_script = os.path.join("frontend", "package.json")
-    backend_script = "manage.py" if os.path.exists(os.path.join(project_dir, "manage.py")) else None
+    backend_script = None
+    for candidate in ("manage.py", os.path.join("backend", "manage.py"), os.path.join("server", "manage.py")):
+        if os.path.exists(os.path.join(project_dir, candidate)):
+            backend_script = candidate
+            break
     if script == frontend_script and backend_script:
         scripts = [backend_script, frontend_script]
 

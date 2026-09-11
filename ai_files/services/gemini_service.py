@@ -6,6 +6,14 @@ from pydantic import BaseModel, Field
 from llm.client import client, MODEL_NAME
 
 
+def generate_response(prompt: str) -> str:
+    """Return the model text through a small seam that tests can mock."""
+    return client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+    ).text
+
+
 class ExpenseData(BaseModel):
     amount: float = Field(..., description="The total expense amount")
     merchant: str = Field(..., description="The store or service name")
@@ -35,12 +43,7 @@ Do not include markdown, code blocks, or explanations.
 """
 
         try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-            )
-
-            response_text = response.text.strip()
+            response_text = generate_response(prompt).strip()
 
             clean_json = re.sub(
                 r"```json\s*|\s*```",

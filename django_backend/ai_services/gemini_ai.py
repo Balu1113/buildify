@@ -20,6 +20,13 @@ FALLBACK_MODEL_NAMES = os.getenv("GEMINI_FALLBACK_MODELS", "")
 
 _client = None
 _model_context = threading.local()
+LEGACY_MODEL_ALIASES = {
+    "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
+    "llama-4-scout-17b-16e-instruct": "openai/gpt-oss-120b",
+    "qwen/qwen3-32b": "openai/gpt-oss-120b",
+    "moonshotai/kimi-k2-instruct": "openai/gpt-oss-120b",
+    "meta-llama/llama-4-maverick-17b-128e-instruct": "openai/gpt-oss-120b",
+}
 
 
 class GeminiAPIError(Exception):
@@ -127,13 +134,13 @@ def _generate_content(contents):
 def generate_response(prompt: str, model_name: Optional[str] = None) -> str:
     try:
         if model_name:
+            model_name = LEGACY_MODEL_ALIASES.get(model_name, model_name)
             if not model_name.startswith(("gemini-", "gemma-")):
                 base_url = (
                     "https://api.groq.com/openai/v1"
                     if model_name in {
-                        "llama-3.3-70b-versatile",
-                        "llama-4-scout-17b-16e-instruct",
-                        "qwen/qwen3-32b",
+                        "openai/gpt-oss-120b",
+                        "openai/gpt-oss-20b",
                     }
                     else "https://integrate.api.nvidia.com/v1"
                 )

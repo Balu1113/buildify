@@ -51,6 +51,7 @@ export const projectAPI = {
   get: (id) => api.get(`/projects/${id}/`),
   create: (data) => api.post("/projects/", data),
   update: (id, data) => api.put(`/projects/${id}/`, data),
+  patch: (id, data) => api.patch(`/projects/${id}/`, data),
   delete: (id) => api.delete(`/projects/${id}/`),
 };
 

@@ -108,4 +108,5 @@ GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME")
 
 # OpenAI API Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "deepseek-ai/deepseek-v4-pro-0813")
+OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "nex-agi/nex-n2.5-pro:free")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
