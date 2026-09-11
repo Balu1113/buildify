@@ -273,7 +273,7 @@ pexpect==4.9.0
 pgvector==0.3.6
 pickleshare==0.7.5
 pillow==12.1.0
-platformdirs==4.5.1
+platformdirs===2.5.0
 playwright==1.62.0
 pluggy==1.6.0
 pooch==1.8.2
