@@ -557,7 +557,7 @@ Be specific and constructive. Do not include markdown or code blocks."""
 # Project Modification
 # ---------------------------------------------------------------------------
 
-def modify_project(source_files: dict, modification: str) -> Optional[dict]:
+def modify_project(source_files: dict, modification: str, model_name: Optional[str] = None) -> Optional[dict]:
     files_text = "\n\n".join(
         f"=== {filename} ===\n{content}" for filename, content in source_files.items()
     )
@@ -589,7 +589,7 @@ Rules:
 - Return complete file contents, not diffs
 - Do not include markdown or code blocks outside the JSON"""
     try:
-        response_text = generate_response(prompt).strip()
+        response_text = generate_response(prompt, model_name=model_name).strip()
         clean_json = re.sub(r"```json\s*|\s*```", "", response_text).strip()
         return json.loads(clean_json)
     except GeminiAPIError:
@@ -600,7 +600,7 @@ Rules:
         raise GeminiAPIError(f"AI modification response could not be processed: {e}", 502) from e
 
 
-def project_chat(source_files: dict, message: str, conversation=None, apply_changes=False) -> Optional[dict]:
+def project_chat(source_files: dict, message: str, conversation=None, apply_changes=False, model_name: Optional[str] = None) -> Optional[dict]:
     """Advise on a generated project and optionally return an explicit change set."""
     files_text = "\n\n".join(
         f"=== {filename} ===\n{content[:12000]}" for filename, content in source_files.items()
@@ -649,7 +649,7 @@ Rules:
 - Never reference or import the Buildify host application.
 - Do not include markdown outside the JSON."""
     try:
-        response_text = generate_response(prompt).strip()
+        response_text = generate_response(prompt, model_name=model_name).strip()
         clean_json = re.sub(r"```json\s*|\s*```", "", response_text).strip()
         result = json.loads(clean_json)
         if not isinstance(result, dict):

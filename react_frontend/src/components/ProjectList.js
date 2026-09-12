@@ -347,7 +347,7 @@ const ProjectList = () => {
     setModifyPrompt(""); setModifyLoading(true);
     setModifyHistory((h) => [...h, { role: "user", text: prompt }]);
     try {
-      const r = await generatedAPI.chat(`project_${selectedProject}`, prompt, modifyHistory, applyChatChanges);
+      const r = await generatedAPI.chat(`project_${selectedProject}`, prompt, modifyHistory, applyChatChanges, selectedAiModel);
       const data = r.data;
       const recommendations = (data.recommendations || []).map((item) => `${item.priority.toUpperCase()}: ${item.title} (${item.effort})`).join("\n");
       const changed = (data.changed_files || []).join(", ");

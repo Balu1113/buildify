@@ -628,9 +628,10 @@ def modify_project(request, project_id):
         return Response({"error": "modification parameter required"}, status=status.HTTP_400_BAD_REQUEST)
 
     source_files = load_project_files(project)
+    model_name = request.data.get("model")
 
     try:
-        result = gemini_ai.modify_project(source_files, modification)
+        result = gemini_ai.modify_project(source_files, modification, model_name=model_name)
     except gemini_ai.GeminiAPIError as error:
         is_rate_limited = error.status_code == 429 or "resource_exhausted" in str(error).lower()
         if is_rate_limited:
@@ -692,6 +693,7 @@ def project_chat(request, project_id):
     if not isinstance(conversation, list):
         return Response({"error": "conversation must be a list"}, status=status.HTTP_400_BAD_REQUEST)
     apply_changes = bool(request.data.get("apply_changes", False))
+    model_name = request.data.get("model")
 
     try:
         result = gemini_ai.project_chat(
@@ -699,6 +701,7 @@ def project_chat(request, project_id):
             message,
             conversation=conversation[-20:],
             apply_changes=apply_changes,
+            model_name=model_name,
         )
     except gemini_ai.GeminiAPIError as error:
         return Response(

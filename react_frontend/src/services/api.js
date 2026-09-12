@@ -102,13 +102,14 @@ export const generatedAPI = {
   files: (projectId) => api.get(`/ai/generated/${projectId}/files/`),
   readFile: (projectId, filePath) =>
     api.get(`/ai/generated/${projectId}/file/`, { params: { file_path: filePath } }),
-  modify: (projectId, modification) =>
-    api.post(`/ai/generated/${projectId}/modify/`, { modification }),
-  chat: (projectId, message, conversation = [], applyChanges = false) =>
+  modify: (projectId, modification, model) =>
+    api.post(`/ai/generated/${projectId}/modify/`, { modification, model }),
+  chat: (projectId, message, conversation = [], applyChanges = false, model) =>
     api.post(`/ai/generated/${projectId}/chat/`, {
       message,
       conversation,
       apply_changes: applyChanges,
+      model,
     }),
   saveFile: (projectId, filePath, content) =>
     api.put(`/ai/generated/${projectId}/save/`, { file_path: filePath, content }),
