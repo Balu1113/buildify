@@ -136,6 +136,179 @@ from projects.models import Project
 MAX_RETRIES = 5
 MAX_FILE_CONTENT = 8000
 PROJECT_EXCLUDED_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
+
+
+QUALITY_GATE_ENV = "BUILDIFY_QUALITY_GATES"
+
+
+def _task_acceptance_contract(task):
+    """Build a structured, model-independent acceptance contract for every task."""
+    description = (task.description or "").strip()
+    task_text = f"{task.title} {description}".lower()
+    prohibited = [
+        "Do not bypass, weaken, or remove tests to obtain a passing result.",
+        "Do not commit real credentials, tokens, or private keys.",
+    ]
+    if any(keyword in task_text for keyword in ("frontend", "react", "javascript", "typescript", "browser")):
+        prohibited.append("Do not use eval(), Function(), new Function(), or equivalent dynamic code execution.")
+    if any(keyword in task_text for keyword in ("api", "backend", "deployment", "configuration")):
+        prohibited.append("Do not hardcode deployment endpoints or disable authentication and authorization.")
+    return {
+        "version": 1,
+        "task": {"id": getattr(task, "pk", None), "title": task.title, "description": description},
+        "functional_requirements": [description] if description else [task.title],
+        "non_functional_requirements": [
+            "Preserve existing public behavior and project architecture.",
+            "Use complete, maintainable implementation with appropriate error handling.",
+        ],
+        "security_requirements": [
+            "Do not introduce arbitrary code execution, secret leakage, or unsafe input handling.",
+            "Keep authentication, authorization, and user data scoped to the existing API contract.",
+        ],
+        "required_files_components": [
+            "All source files, components, configuration, and API changes necessary for the stated requirements.",
+        ],
+        "test_requirements": [
+            "Test each stated functional requirement, important edge cases, and security-sensitive behavior.",
+            "Tests must run against the actual generated project and existing APIs.",
+        ],
+        "reviewer_acceptance_criteria": [
+            "All functional and contract requirements are implemented.",
+            "Tests pass and no critical or major findings remain.",
+            "Deterministic quality and security gates pass.",
+        ],
+        "prohibited_approaches": prohibited,
+    }
+
+
+def _contract_text(contract):
+    return json.dumps(contract, indent=2, ensure_ascii=True)
+
+
+def _retry_context_text(retry_context):
+    return json.dumps(retry_context or {}, indent=2, ensure_ascii=True)
+
+
+def _quality_gate_config():
+    configured = os.getenv(QUALITY_GATE_ENV, "all").strip().lower()
+    if configured in {"", "all", "default"}:
+        return {"dynamic_code", "secrets", "production_config", "hardcoded_urls"}
+    return {item.strip() for item in configured.split(",") if item.strip()}
+
+
+def _deterministic_quality_gates(files):
+    """Run conservative, configurable source checks without rejecting ordinary words."""
+    enabled = _quality_gate_config()
+    violations = []
+    for filepath, content in files.items():
+        if not isinstance(content, str):
+            continue
+        normalized_path = filepath.replace("\\", "/")
+        source_path = normalized_path.lower()
+        filename = source_path.rsplit("/", 1)[-1]
+        is_test = (
+            source_path.startswith("tests/")
+            or "/tests/" in source_path
+            or "/__tests__/" in source_path
+            or filename.endswith((".test.js", ".test.jsx", ".test.ts", ".test.tsx"))
+            or filename.endswith((".spec.js", ".spec.jsx", ".spec.ts", ".spec.tsx"))
+        )
+        is_frontend = source_path.endswith((".js", ".jsx", ".ts", ".tsx"))
+        is_code = source_path.endswith((".js", ".jsx", ".ts", ".tsx", ".py"))
+        if "dynamic_code" in enabled and is_code and not is_test:
+            patterns = [
+                (r"(?<![\w$.])eval\s*\(", "dynamic eval"),
+            ]
+            if source_path.endswith(".py"):
+                patterns.append((r"\bexec\s*\(", "dynamic exec"))
+            if is_frontend:
+                patterns.extend([
+                    (r"\bnew\s+Function\s*\(", "dynamic Function constructor"),
+                    (r"(?<![\w$.])Function\s*\(", "dynamic Function call"),
+                ])
+            for pattern, label in patterns:
+                if re.search(pattern, content):
+                    violations.append({
+                        "severity": "critical",
+                        "category": "security",
+                        "file": filepath,
+                        "issue": f"Detected {label} in executable frontend source.",
+                        "why": "It permits arbitrary or uncontrolled code execution.",
+                        "required_fix": "Replace it with explicit parsing or controlled allowlisted operations.",
+                    })
+        if "secrets" in enabled and not is_test:
+            secret_pattern = re.compile(
+                r"(?i)\b(?:secret|password|api[_-]?key|access[_-]?token)\b\s*[:=]\s*['\"][^'\"]{8,}['\"]"
+            )
+            secret_matches = secret_pattern.finditer(content)
+            real_secret = any(
+                all(marker not in value.group(0).lower()
+                    for marker in ("change-in-prod", "change_me", "placeholder", "your-", "example"))
+                for value in secret_matches
+            )
+            if real_secret and "example" not in source_path:
+                violations.append({
+                    "severity": "critical",
+                    "category": "security",
+                    "file": filepath,
+                    "issue": "A likely hardcoded secret or credential was detected.",
+                    "why": "Credentials must not be committed to generated source.",
+                    "required_fix": "Read the value from a deployment environment or secret manager.",
+                })
+        if "production_config" in enabled and source_path.endswith(("settings.py", ".env", ".env.production")):
+            if re.search(r"(?m)^\s*DEBUG\s*=\s*True\b", content):
+                violations.append({
+                    "severity": "major",
+                    "category": "configuration",
+                    "file": filepath,
+                    "issue": "DEBUG is enabled in a production-facing configuration.",
+                    "why": "Debug output can disclose sensitive application details.",
+                    "required_fix": "Read DEBUG from the environment with a secure production default.",
+                })
+            if re.search(r"(?m)^\s*CORS_ALLOW_ALL_ORIGINS\s*=\s*True\b", content):
+                violations.append({
+                    "severity": "major",
+                    "category": "security",
+                    "file": filepath,
+                    "issue": "CORS allows every origin in configuration.",
+                    "why": "Production APIs should restrict browser origins.",
+                    "required_fix": "Configure an explicit environment-driven allowlist.",
+                })
+        if "hardcoded_urls" in enabled and is_frontend and not is_test:
+            for url in re.findall(r"https?://[^\s'\"`]+", content):
+                if not re.search(r"https?://(?:localhost|127\.0\.0\.1)(?::\d+)?(?:/|$)", url):
+                    violations.append({
+                        "severity": "major",
+                        "category": "configuration",
+                        "file": filepath,
+                        "issue": f"Hardcoded non-local API URL detected: {url}",
+                        "why": "Deployment endpoints must be configurable.",
+                        "required_fix": "Read the endpoint from the project's environment configuration.",
+                    })
+    return violations
+
+
+def _blocking_findings(findings):
+    return [
+        finding for finding in (findings or [])
+        if str(finding.get("severity", "")).lower() in {"critical", "major", "high"}
+    ]
+
+
+def _normalize_findings(findings):
+    """Keep reviewer output compatible while enforcing the structured finding contract."""
+    normalized = []
+    for finding in findings or []:
+        if not isinstance(finding, dict):
+            continue
+        item = dict(finding)
+        item["issue"] = item.get("issue") or item.get("message", "Unspecified reviewer finding")
+        item["why"] = item.get("why") or "The reviewer did not explain the contract violation."
+        item["required_fix"] = item.get("required_fix") or item.get("suggestion", "Address the finding.")
+        normalized.append(item)
+    return normalized
+
+
 class PipelineStopped(Exception):
     """Raised when a user stops a running pipeline."""
 
@@ -334,7 +507,8 @@ def _project_preflight(project_files):
     return failures
 
 
-def _repair_workspace(task, project, project_files, project_dir, pipeline, diagnostics, model_name):
+def _repair_workspace(task, project, project_files, project_dir, pipeline, diagnostics, model_name,
+                      acceptance_contract=None, retry_context=None):
     """Ask the Debugger to repair pipeline diagnostics and validate its patch."""
     repair_result = _run_debugger(
         task,
@@ -343,6 +517,12 @@ def _repair_workspace(task, project, project_files, project_dir, pipeline, diagn
         project_dir,
         {"passed": False, "test_output": "Pipeline diagnostics:\n" + "\n".join(diagnostics)},
         pipeline,
+        acceptance_contract=acceptance_contract or _task_acceptance_contract(task),
+        retry_context=retry_context or {
+            "attempt": 0,
+            "test_failures": diagnostics,
+            "unresolved_issues": diagnostics,
+        },
         model_name=model_name,
     )
     if not repair_result.get("fixed", False):
@@ -469,11 +649,32 @@ def _run_pipeline_worker(project_id):
 
             task_completed = False
             last_error = None
+            acceptance_contract = _task_acceptance_contract(task)
+            retry_context = {
+                "original_task": acceptance_contract["task"],
+                "acceptance_contract": acceptance_contract,
+                "attempt": 0,
+                "implementation_files": {},
+                "test_files": {},
+                "debugger_files": {},
+                "files_changed": [],
+                "test_failures": [],
+                "debugger_analysis": [],
+                "reviewer_findings": [],
+                "unresolved_issues": [],
+            }
+            pipeline.append_log(
+                f"[Acceptance] Functional: {len(acceptance_contract['functional_requirements'])}; "
+                f"security: {len(acceptance_contract['security_requirements'])}; "
+                f"tests: {len(acceptance_contract['test_requirements'])}"
+            )
 
             for attempt in range(MAX_RETRIES + 1):
                 _raise_if_pipeline_stopped(pipeline)
+                retry_context["attempt"] = attempt
                 pipeline.append_log(
-                    f"[AI] Using model: {selected_model}"
+                    f"[AI] Using model: {selected_model} | task {i + 1}/{len(tasks)} | "
+                    f"attempt {attempt + 1}/{MAX_RETRIES + 1}"
                 )
                 if attempt > 0:
                     pipeline.append_log(f"\n--- Retry attempt {attempt}/{MAX_RETRIES} ---")
@@ -486,12 +687,29 @@ def _run_pipeline_worker(project_id):
                 try:
                     dev_result = _run_developer(
                         task, project, all_tasks, project_files, project_dir, pipeline,
-                        previous_error=None if attempt == 0 else last_error,
+                        acceptance_contract=acceptance_contract,
+                        retry_context=retry_context,
+                        attempt=attempt,
                         model_name=selected_model,
                     )
                     _raise_if_pipeline_stopped(pipeline)
                     new_files = _validated_file_map(dev_result.get("files"), "Developer")
                     pipeline.append_log(f"[Developer] Generated {len(new_files)} files")
+
+                    candidate_files = dict(project_files)
+                    candidate_files.update(new_files)
+                    retry_context["implementation_files"] = dict(new_files)
+                    retry_context["files_changed"] = sorted(new_files)
+                    quality_violations = _deterministic_quality_gates(candidate_files)
+                    if quality_violations:
+                        last_error = (
+                            "Deterministic quality gates failed: "
+                            + "; ".join(item["issue"] for item in quality_violations)
+                        )
+                        retry_context["unresolved_issues"] = quality_violations
+                        pipeline.append_log(f"[Developer] {last_error}")
+                        pipeline.append_log(f"[Quality] {len(quality_violations)} blocking violation(s)")
+                        continue
 
                     # Verify and write files
                     verification_errors = []
@@ -512,6 +730,11 @@ def _run_pipeline_worker(project_id):
 
                         project_files[fname] = content
                         _write_file(project_dir, fname, content)
+
+                    retry_context["implementation_files"] = {
+                        fname: project_files[fname] for fname in new_files
+                    }
+                    retry_context["files_changed"] = sorted(new_files)
 
                     if verification_errors:
                         last_error = "Verification errors: " + "; ".join(verification_errors)
@@ -547,6 +770,13 @@ def _run_pipeline_worker(project_id):
 
                 except Exception as e:
                     last_error = f"Developer error: {e}"
+                    retry_context["unresolved_issues"] = [{
+                        "severity": "major",
+                        "category": "implementation",
+                        "issue": last_error,
+                        "why": "The Developer stage did not produce a valid implementation.",
+                        "required_fix": "Resolve the reported developer error and return complete files.",
+                    }]
                     pipeline.append_log(f"[Developer] Error: {e}")
                     pipeline.stage = PipelineRun.Stage.DEBUGGING
                     pipeline.save(update_fields=["stage"])
@@ -569,14 +799,24 @@ def _run_pipeline_worker(project_id):
                     _raise_if_pipeline_stopped(pipeline)
                     test_result = _run_tester(
                         task, project, all_tasks, project_files, project_dir, pipeline,
+                        acceptance_contract=acceptance_contract,
+                        retry_context=retry_context,
+                        attempt=attempt,
                         model_name=selected_model,
                     )
                     test_passed = test_result.get("passed", False)
                     pipeline.append_log(
                         f"[Tester] Tests {'PASSED' if test_passed else 'FAILED'}"
                     )
+                    retry_context["test_failures"] = [] if test_passed else [
+                        test_result.get("test_output", "No test output available")
+                    ]
 
                     test_files = _validated_file_map(test_result.get("test_files", {}), "Tester")
+                    retry_context["test_files"] = dict(test_files)
+                    retry_context["files_changed"] = sorted(
+                        set(retry_context["files_changed"]) | set(test_files)
+                    )
                     for fname, content in test_files.items():
                         project_files[fname] = content
                         _write_file(project_dir, fname, content)
@@ -585,6 +825,14 @@ def _run_pipeline_worker(project_id):
                     pipeline.append_log(f"[Tester] Error: {e}")
                     test_result = {"passed": False, "test_output": str(e)}
                     test_passed = False
+                    retry_context["test_failures"] = [str(e)]
+                    retry_context["unresolved_issues"] = [{
+                        "severity": "major",
+                        "category": "testing",
+                        "issue": str(e),
+                        "why": "The test stage did not complete successfully.",
+                        "required_fix": "Repair the test or implementation failure and rerun the suite.",
+                    }]
                     pipeline.stage = PipelineRun.Stage.DEBUGGING
                     pipeline.save(update_fields=["stage"])
                     pipeline.append_log("[Debugger] Repairing tester failure...")
@@ -606,12 +854,23 @@ def _run_pipeline_worker(project_id):
                     try:
                         debug_result = _run_debugger(
                             task, project, project_files, project_dir,
-                            test_result, pipeline, model_name=selected_model,
+                            test_result, pipeline,
+                            acceptance_contract=acceptance_contract,
+                            retry_context=retry_context,
+                            attempt=attempt,
+                            model_name=selected_model,
                         )
                         fixed = debug_result.get("fixed", False)
+                        retry_context["debugger_analysis"] = [
+                            debug_result.get("diagnosis", "No debugger diagnosis returned")
+                        ]
                         pipeline.append_log(f"[Debugger] Fix {'applied' if fixed else 'not applied'}")
 
                         debug_files = _validated_file_map(debug_result.get("files", {}), "Debugger")
+                        retry_context["debugger_files"] = dict(debug_files)
+                        retry_context["files_changed"] = sorted(
+                            set(retry_context["files_changed"]) | set(debug_files)
+                        )
                         for fname, content in debug_files.items():
                             project_files[fname] = content
                             _write_file(project_dir, fname, content)
@@ -642,17 +901,34 @@ def _run_pipeline_worker(project_id):
                 try:
                     review = _run_reviewer(
                         task, project, project_files, project_dir, pipeline,
+                        acceptance_contract=acceptance_contract,
+                        retry_context=retry_context,
+                        attempt=attempt,
                         model_name=selected_model,
                     )
                     score = review.get("score", 0)
                     status = review.get("overall_status", "unknown")
-                    review_approved = status == "approved"
+                    reviewer_findings = _normalize_findings(review.get("findings", []))
+                    review["findings"] = reviewer_findings
+                    retry_context["reviewer_findings"] = reviewer_findings
+                    quality_violations = _deterministic_quality_gates(project_files)
+                    blocking_findings = _blocking_findings(reviewer_findings)
+                    review_approved = (
+                        status == "approved"
+                        and not blocking_findings
+                        and not quality_violations
+                    )
+                    retry_context["unresolved_issues"] = blocking_findings + quality_violations
                     pipeline.append_log(f"[Reviewer] Status: {status}, Score: {score}/10")
+                    pipeline.append_log(
+                        f"[Quality] {'PASSED' if not quality_violations else 'FAILED'}; "
+                        f"unresolved findings: {len(blocking_findings)}"
+                    )
 
                     if review.get("findings"):
                         for f in review["findings"][:5]:
                             sev = f.get("severity", "?")
-                            msg = f.get("message", "")
+                            msg = f.get("issue", f.get("message", ""))
                             pipeline.append_log(f"  [{sev.upper()}] {msg}")
 
                 except Exception as e:
@@ -675,8 +951,12 @@ def _run_pipeline_worker(project_id):
                 last_error = (
                     "Task acceptance failed: "
                     f"tests={'passed' if test_passed else 'failed'}, "
-                    f"review={'approved' if review_approved else 'changes required'}"
+                    f"review={'approved' if review_approved else 'changes required'}, "
+                    f"unresolved issues={len(retry_context['unresolved_issues'])}"
                 )
+                retry_context["unresolved_issues"] = retry_context["unresolved_issues"] or [
+                    {"issue": last_error, "severity": "major"}
+                ]
                 pipeline.append_log(f"[Retry] {last_error}")
 
             if task_completed:
@@ -690,6 +970,9 @@ def _run_pipeline_worker(project_id):
                 )
                 pipeline.save(update_fields=["stage", "error"])
                 pipeline.append_log(f"[Failed] Task '{task.title}' failed after {MAX_RETRIES + 1} attempts.")
+                pipeline.append_log(
+                    "[FailureContext] " + _retry_context_text(retry_context)
+                )
                 pipeline.append_log(f"[Stopped] {pipeline.error}")
                 raise PipelineStopped()
 
@@ -790,7 +1073,8 @@ def _run_pipeline_worker(project_id):
 # ---------------------------------------------------------------------------
 
 def _run_developer(task, project, all_tasks, existing_files, project_dir, pipeline,
-                   previous_error=None, model_name=None):
+                   previous_error=None, acceptance_contract=None, retry_context=None,
+                   attempt=0, model_name=None):
     file_tree = build_file_tree(existing_files)
     total_files = len(existing_files)
 
@@ -812,17 +1096,10 @@ def _run_developer(task, project, all_tasks, existing_files, project_dir, pipeli
                 truncated += f"\n... [truncated, {len(content)} total chars]"
             files_section += f"\n--- {fname} ({len(content)} chars) ---\n{truncated}\n"
 
-    error_section = ""
-    if previous_error:
-        error_section = f"""
-PREVIOUS ATTEMPT FAILED:
-{previous_error}
-
-You MUST fix this issue in your implementation. Pay special attention to:
-- Valid Python syntax (no indentation errors, no undefined variables)
-- Correct imports (only import what exists in the project files)
-- Complete file content (not placeholders or "rest of code here")
-"""
+    if acceptance_contract is None:
+        acceptance_contract = _task_acceptance_contract(task)
+    if retry_context is None:
+        retry_context = {"attempt": attempt}
 
     prompt = f"""You are an expert senior software engineer generating production-quality code for a student project.
 
@@ -849,10 +1126,17 @@ Current (THIS TASK): {task.title}
 Remaining:
 {chr(10).join(pending_tasks) if pending_tasks else "(none)"}
 
-{error_section}
+=== ACCEPTANCE CONTRACT ===
+{_contract_text(acceptance_contract)}
+
+=== RETRY CONTEXT ===
+{_retry_context_text(retry_context)}
 
 === INSTRUCTIONS ===
-Generate COMPLETE, WORKING implementation for the current task. You must:
+Generate COMPLETE, WORKING implementation for the current task. For retry
+attempt {attempt + 1}, modify the current implementation and explicitly resolve
+EVERY unresolved issue, test failure, and reviewer finding in RETRY CONTEXT.
+Do not blindly regenerate the task from scratch. You must:
 
 1. **Create all necessary files** for this task - models, views, serializers, URLs, templates, components, config files, etc.
 2. **Write COMPLETE code** - no placeholders, no "TODO", no "rest of code here", no "..." ellipsis
@@ -1004,6 +1288,7 @@ This is the #1 cause of syntax errors in generated code. Always write dictionary
 # ---------------------------------------------------------------------------
 
 def _run_tester(task, project, all_tasks, project_files, project_dir, pipeline,
+                acceptance_contract=None, retry_context=None, attempt=0,
                 model_name=None):
     source_files = {k: v for k, v in project_files.items() if not k.startswith("tests/")}
     test_files = {k: v for k, v in project_files.items() if k.startswith("tests/")}
@@ -1017,6 +1302,9 @@ def _run_tester(task, project, all_tasks, project_files, project_dir, pipeline,
             source_section += f"\n--- {fname} ---\n{truncated}\n"
     source_section = source_section[:24000]
 
+    acceptance_contract = acceptance_contract or _task_acceptance_contract(task)
+    retry_context = retry_context or {"attempt": attempt}
+
     prompt = f"""You are an expert QA engineer generating comprehensive test suites for a student project.
 
 === PROJECT ===
@@ -1027,18 +1315,26 @@ Description: {project.description}
 Title: {task.title}
 Description: {task.description}
 
+=== ACCEPTANCE CONTRACT ===
+{_contract_text(acceptance_contract)}
+
+=== RETRY CONTEXT ===
+{_retry_context_text(retry_context)}
+
 === SOURCE CODE ===
 {source_section}
 
 === INSTRUCTIONS ===
 Generate thorough pytest tests for the task above. Tests must:
 
-1. **Test all functionality** described in the task
+1. **Test all functionality** described in the task and every acceptance-contract requirement
 2. **Use correct imports** - import from the actual source files that exist
 3. **Use pytest conventions** - test functions start with test_, use assertions
 4. **Be runnable** - no syntax errors, correct module paths
 5. **Cover edge cases** - test normal flow, error cases, boundary conditions
 6. **Use fixtures** where appropriate for setup/teardown
+7. **Test security and edge cases**, including invalid input, authorization boundaries,
+   configuration errors, and prohibited approaches identified by the contract
 
 IMPORTANT: You MUST import from the actual source modules. If a file is at tasks/models.py, import from tasks.models. Do NOT invent functions or classes that don't exist.
 
@@ -1115,6 +1411,7 @@ DJANGO TEST RULES (apply whenever the project uses Django):
 # ---------------------------------------------------------------------------
 
 def _run_debugger(task, project, project_files, project_dir, test_result, pipeline,
+                  acceptance_contract=None, retry_context=None, attempt=0,
                   model_name=None):
     source_files = {k: v for k, v in project_files.items() if not k.startswith("tests/")}
     test_files = {k: v for k, v in project_files.items() if k.startswith("tests/")}
@@ -1130,6 +1427,8 @@ def _run_debugger(task, project, project_files, project_dir, test_result, pipeli
         truncated = content[:MAX_FILE_CONTENT]
         test_section += f"\n--- {fname} ---\n{truncated}\n"
 
+    acceptance_contract = acceptance_contract or _task_acceptance_contract(task)
+    retry_context = retry_context or {"attempt": attempt}
     test_output = test_result.get("test_output", "No output available")
 
     prompt = f"""You are an expert debugger fixing failing tests in a student project.
@@ -1141,20 +1440,29 @@ Name: {project.name}
 Title: {task.title}
 Description: {task.description}
 
+=== ACCEPTANCE CONTRACT ===
+{_contract_text(acceptance_contract)}
+
+=== RETRY CONTEXT ===
+{_retry_context_text(retry_context)}
+
 === SOURCE FILES ===
 {source_section}
 
 === TEST FILES ===
 {test_section}
 
-=== TEST OUTPUT (FAILING) ===
+=== TEST OUTPUT, STACK TRACE, AND FAILURES ===
 {test_output}
 
 === INSTRUCTIONS ===
-Analyze the diagnostics and fix the actual source, test, or project configuration
+Analyze the failing tests, stack traces, reviewer findings, and acceptance contract.
+Fix the actual source, test, or project configuration
 failure. This may be a preflight scan before tests run. Inspect the complete file
 tree and repair malformed, missing, inconsistent, or incompatible files instead
 of only suppressing the reported error. Return complete replacement file contents.
+Make targeted changes and resolve every applicable item in RETRY CONTEXT; do not
+rewrite unrelated parts of the project.
 
 Common issues to check:
 1. Syntax errors in source or test files
@@ -1235,6 +1543,7 @@ CRITICAL RULES:
 # ---------------------------------------------------------------------------
 
 def _run_reviewer(task, project, project_files, project_dir, pipeline,
+                  acceptance_contract=None, retry_context=None, attempt=0,
                   model_name=None):
     source_files = {k: v for k, v in project_files.items() if not k.startswith("tests/")}
 
@@ -1247,6 +1556,9 @@ def _run_reviewer(task, project, project_files, project_dir, pipeline,
 
     pytest_result = _execute_pytest(project_dir)
     test_output = pytest_result["output"]
+
+    acceptance_contract = acceptance_contract or _task_acceptance_contract(task)
+    retry_context = retry_context or {"attempt": attempt}
 
     prompt = f"""You are a senior software engineer performing a code review for a student project.
 
@@ -1261,6 +1573,12 @@ Description: {project.description}
 Title: {task.title}
 Description: {task.description}
 
+=== ACCEPTANCE CONTRACT ===
+{_contract_text(acceptance_contract)}
+
+=== RETRY CONTEXT ===
+{_retry_context_text(retry_context)}
+
 === SOURCE CODE ===
 {source_section}
 
@@ -1269,7 +1587,7 @@ Description: {task.description}
 {test_output[:3000]}
 
 === REVIEW CRITERIA ===
-Evaluate the implementation on:
+Evaluate the implementation against the acceptance contract and task on:
 1. **Completeness** (0-2): Are all requirements from the task description met?
 2. **Correctness** (0-2): Does the code work correctly? Are there bugs?
 3. **Code Quality** (0-2): Is it readable, well-structured, following conventions?
@@ -1279,6 +1597,9 @@ Evaluate the implementation on:
     project's configured BASE_DIR / 'db.sqlite3' default without a hidden
     DATABASE_NAME=:memory: override, and confirm frontend workflows remain
     usable at mobile widths with responsive layouts and touch-sized controls.
+7. Every finding must explain why it violates the acceptance contract and state
+    the required fix. A critical or major contract violation requires
+    "overall_status": "changes_required".
 
 Return ONLY valid JSON:
 {{
@@ -1287,9 +1608,12 @@ Return ONLY valid JSON:
     "findings": [
         {{
             "severity": "critical|major|minor",
-            "category": "security|performance|readability|correctness|completeness",
-            "message": "<specific issue found>",
+            "category": "security|performance|readability|correctness|completeness|configuration|testing|architecture",
             "file": "<filename>",
+            "issue": "<specific issue found>",
+            "why": "<why this violates the acceptance contract>",
+            "required_fix": "<required fix>",
+            "message": "<specific issue found>",
             "suggestion": "<how to fix>"
         }}
     ],
