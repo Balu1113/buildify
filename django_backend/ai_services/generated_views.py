@@ -193,49 +193,32 @@ def _get_run_command(project_dir, script, port=None):
 
 import shutil
 def _ensure_node_dependencies(project_dir, script):
+    """
+    Check if a frontend project is ready to run.
+    
+    For preview, we only serve pre-built projects (dist/build/out).
+    npm install is expensive and blocks the worker; it should only run during pipeline finalization.
+    """
     if not script.endswith("package.json"):
         return None
 
     package_dir = os.path.dirname(os.path.join(project_dir, script))
 
-    if os.path.isdir(os.path.join(package_dir, "node_modules")):
-        return None
+    # Check for pre-built frontend from pipeline finalization
+    for build_dir_name in ("dist", "build", "out"):
+        if os.path.isdir(os.path.join(package_dir, build_dir_name)):
+            # Pre-built frontend is available; no dependency installation needed
+            return None
 
-    npm_command = shutil.which("npm.cmd" if os.name == "nt" else "npm")
-
-    if npm_command is None:
-        return {
-            "status": "environment-unavailable",
-            "tool_unavailable": "npm",
-            "severity": "environment",
-            "error": "tool_unavailable: npm",
-            "message": "The generated frontend is structurally valid, but this server does not have Node.js/npm installed.",
-        }
-
-    try:
-        result = subprocess.run(
-            [npm_command, "install"],
-            cwd=package_dir,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except subprocess.TimeoutExpired:
-        return "Unable to install JavaScript dependencies: npm install timed out"
-    except OSError as error:
-        return f"Unable to install JavaScript dependencies: {error}"
-
-    if result.returncode != 0:
-        details = (
-            result.stderr
-            or result.stdout
-            or "npm install failed"
-        ).strip()
-
-        return f"Unable to install JavaScript dependencies: {details[-1000:]}"
-
-    return None
+    # No pre-built files found. At preview time, we don't run npm install
+    # because it's too slow and blocks the worker. Instead, return a message
+    # telling the user to complete pipeline finalization.
+    return {
+        "status": "not-ready",
+        "severity": "user-action-required",
+        "error": "frontend_not_built",
+        "message": "Frontend not yet built. Complete the project pipeline finalization to generate the optimized build (dist/).",
+    }
 
 def _start_process(project_id, project_dir, script):
     if project_id in _running_processes:
@@ -275,14 +258,11 @@ def _start_process(project_id, project_dir, script):
             )
 
             if dependency_error:
-                # npm/node is unavailable in the execution environment.
-                if (
-                    isinstance(dependency_error, dict)
-                    and dependency_error.get("status") == "environment-unavailable"
-                ):
+                # Frontend is not built or npm is unavailable
+                if isinstance(dependency_error, dict):
+                    # Return structured error (environment-unavailable or not-ready)
                     for info in processes:
                         info["proc"].terminate()
-
                     return None, dependency_error
 
                 raise RuntimeError(dependency_error)
@@ -547,7 +527,7 @@ def run_project(request, project_id):
     if error:
         if (
             isinstance(error, dict)
-            and error.get("status") == "environment-unavailable"
+            and error.get("status") in ("environment-unavailable", "not-ready")
         ):
             return Response(
                 error,

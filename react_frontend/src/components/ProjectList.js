@@ -384,6 +384,9 @@ const ProjectList = () => {
       if (r.data.status === "environment-unavailable") {
         showToast("Preview unavailable: Node.js/npm is not installed on the server.", "info");
       }
+      if (r.data.status === "not-ready") {
+        showToast(r.data.message || "Frontend not yet built. Complete pipeline finalization.", "info");
+      }
     } catch (err) {
       setRunState({ status: "idle", port: null });
       const data = err.response?.data;
