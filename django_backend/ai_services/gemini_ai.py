@@ -606,7 +606,47 @@ def project_chat(source_files: dict, message: str, conversation=None, apply_chan
         f"=== {filename} ===\n{content[:12000]}" for filename, content in source_files.items()
     )
     history_text = json.dumps(conversation or [], ensure_ascii=True)[-12000:]
-    prompt = f"""You are a senior product engineer, UX strategist, and software architect.
+    
+    if apply_changes:
+        # Mode: Apply changes to the project files
+        prompt = f"""You are a senior software engineer. Your task is to apply the requested changes to the project files.
+
+The user requests:
+{message}
+
+Current project files:
+{files_text}
+
+Conversation history:
+{history_text}
+
+APPLY THE CHANGES NOW. Return ONLY valid JSON with the modified files:
+{{
+  "answer": "Summary of what changes you made and why",
+  "project_assessment": "State of the project after changes",
+  "recommendations": [],
+  "next_steps": [],
+  "change_plan": ["List of files you modified"],
+  "files": {{
+    "<filename>": "<COMPLETE new content of modified files>"
+  }},
+  "new_files": {{
+    "<filename>": "<complete content of any new files to create>"
+  }},
+  "deleted_files": ["<list of filenames to delete if any>"],
+  "changes_applied": true
+}}
+
+CRITICAL RULES:
+- ALWAYS apply the requested changes to files. Do not just suggest them.
+- Return the COMPLETE new content for each file you modify.
+- Include every file change needed to fulfill the user's request.
+- Do not include markdown or code blocks outside the JSON.
+- Preserve existing APIs, authentication, and data models.
+- Never reference or import the Buildify host application."""
+    else:
+        # Mode: Provide advice and recommendations only
+        prompt = f"""You are a senior product engineer, UX strategist, and software architect.
 
 You are advising on an existing generated project. Inspect its actual files before
 making claims. The user asks:
@@ -634,20 +674,18 @@ Return ONLY valid JSON:
     {{"title": "Feature or improvement", "priority": "high|medium|low", "impact": "Expected user or business impact", "effort": "small|medium|large", "reason": "Why it fits this project"}}
   ],
   "next_steps": ["Ordered implementation steps"],
-  "change_plan": ["Files/components that would need changes"],
+  "change_plan": [],
   "files": {{}},
   "new_files": {{}},
   "deleted_files": [],
-  "changes_applied": {str(bool(apply_changes)).lower()}
+  "changes_applied": false
 }}
 
 Rules:
-- Do not claim a change was applied unless apply_changes is true and files are returned.
-- If apply_changes is false, return an empty change set and recommendations only.
-- If apply_changes is true, return complete file contents only for files that need changes.
-- Preserve existing APIs, authentication, project isolation, and persistence.
-- Never reference or import the Buildify host application.
-- Do not include markdown outside the JSON."""
+- Return recommendations and insights only, not file changes.
+- Do not include markdown outside the JSON.
+- Focus on actionable advice."""
+    
     try:
         response_text = generate_response(prompt, model_name=model_name).strip()
         clean_json = re.sub(r"```json\s*|\s*```", "", response_text).strip()

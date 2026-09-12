@@ -664,8 +664,11 @@ const ProjectList = () => {
                     ))}
                   </div>
                 )}
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
+                  <div style={{ flex: 0 }}><label className="form-label" style={{ marginBottom: 0 }}>AI Model</label><ModelProviderSelector value={selectedAiModel} onChange={handleModelChange} disabled={pipeline.stage !== "completed" && pipeline.stage !== "failed"} /></div>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-muted)", marginLeft: "auto" }}><input type="checkbox" checked={applyChatChanges} onChange={(e) => setApplyChatChanges(e.target.checked)} /> Apply changes</label>
+                </div>
                 <div style={{ display: "flex", gap: 8 }}>
-                  <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-muted)" }}><input type="checkbox" checked={applyChatChanges} onChange={(e) => setApplyChatChanges(e.target.checked)} /> Apply changes</label>
                   <input className="input" style={{ flex: 1 }} placeholder="Ask for features, fixes, or competitor-inspired improvements..." value={modifyPrompt} onChange={(e) => setModifyPrompt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleModify(); } }} disabled={modifyLoading} />
                   <button onClick={handleModify} className="btn btn-primary" disabled={modifyLoading || !modifyPrompt.trim()} style={{ padding: "8px 20px" }}>{modifyLoading ? <div className="spinner" style={{ width: 14, height: 14 }} /> : "🚀 Send"}</button>
                 </div>
