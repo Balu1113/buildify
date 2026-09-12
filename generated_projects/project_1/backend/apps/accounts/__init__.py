@@ -1,1 +1,0 @@
-# Django apps root package for accounts

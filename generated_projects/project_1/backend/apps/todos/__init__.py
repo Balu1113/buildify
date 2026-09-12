@@ -1,3 +1,0 @@
-"""
-Todos application package.
-"""

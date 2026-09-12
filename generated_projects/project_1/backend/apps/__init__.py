@@ -1,3 +1,0 @@
-"""
-Django apps root package.
-"""
