@@ -131,6 +131,7 @@ def generate_response(prompt: str, model_name=None) -> str:
 from pipeline.models import PipelineRun
 from tasks.models import Task
 from projects.models import Project
+from projects.storage import load_project_files, materialize_project, persist_workspace, save_generated_file
 
 
 # Stop after a small, bounded set of attempts so the user can switch models and retry.
@@ -332,8 +333,17 @@ def _raise_if_pipeline_stopped(pipeline):
         raise PipelineStopped()
 
 
-def _load_project_files(project_dir):
+def _load_project_files(project_dir, project=None):
     """Hydrate the agent context from the generated project on disk."""
+    if project is not None:
+        persisted = load_project_files(project)
+        if persisted:
+            materialize_project(project, project_dir, clear=True)
+            return persisted
+        if os.path.isdir(project_dir):
+            migrated = persist_workspace(project, project_dir)
+            if migrated:
+                return migrated
     files = {}
     if not os.path.isdir(project_dir):
         return files
@@ -546,7 +556,7 @@ def _repair_workspace(task, project, project_files, project_dir, pipeline, diagn
         if not verification["valid"]:
             raise ValueError(f"Debugger produced invalid {filepath}: {verification['errors']}")
         project_files[filepath] = content
-        _write_file(project_dir, filepath, content)
+        _write_file(project_dir, filepath, content, project)
     return True
 
 
@@ -632,7 +642,7 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
 
         os.makedirs(project_dir, exist_ok=True)
 
-        project_files = _load_project_files(project_dir)
+        project_files = _load_project_files(project_dir, project)
         pipeline.append_log(
             f"[Workspace] Hydrated {len(project_files)} existing files from generated project"
         )
@@ -758,7 +768,7 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
                             pipeline.append_log(f"[Verify] Warning: {fname}: {w}")
 
                         project_files[fname] = content
-                        _write_file(project_dir, fname, content)
+                        _write_file(project_dir, fname, content, project)
 
                     retry_context["implementation_files"] = {
                         fname: project_files[fname] for fname in new_files
@@ -848,7 +858,7 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
                     )
                     for fname, content in test_files.items():
                         project_files[fname] = content
-                        _write_file(project_dir, fname, content)
+                        _write_file(project_dir, fname, content, project)
 
                 except Exception as e:
                     pipeline.append_log(f"[Tester] Error: {e}")
@@ -902,7 +912,7 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
                         )
                         for fname, content in debug_files.items():
                             project_files[fname] = content
-                            _write_file(project_dir, fname, content)
+                            _write_file(project_dir, fname, content, project)
 
                         # Re-run tests after debug
                         if fixed:
@@ -1415,7 +1425,7 @@ DJANGO TEST RULES (apply whenever the project uses Django):
     test_files = _validated_file_map(result.get("test_files", {}), "Tester")
     if test_files and project_dir:
         for fname, content in test_files.items():
-            _write_file(project_dir, fname, content)
+            _write_file(project_dir, fname, content, project)
 
         pytest_result = _execute_pytest(project_dir)
         result["passed"] = pytest_result["passed"]
@@ -1669,12 +1679,14 @@ Be specific and constructive. Do not include markdown or code blocks."""
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _write_file(project_dir, relative_path, content):
+def _write_file(project_dir, relative_path, content, project=None):
     """Write a file to the project directory."""
     full_path = os.path.join(project_dir, relative_path)
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
     with open(full_path, "w", encoding="utf-8") as f:
         f.write(content)
+    if project is not None:
+        save_generated_file(project, relative_path, content)
 
 
 def _execute_pytest(project_dir):
@@ -2531,7 +2543,7 @@ Return ONLY the markdown content of the README. No JSON wrapping."""
                 lines = lines[:-1]
             readme_content = "\n".join(lines).strip()
 
-        _write_file(project_dir, "README.md", readme_content)
+        _write_file(project_dir, "README.md", readme_content, project)
     except Exception:
         pass
 

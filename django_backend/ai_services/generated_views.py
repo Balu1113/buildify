@@ -13,12 +13,44 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from . import gemini_ai
+from projects.models import Project
+from projects.storage import (
+    delete_generated_file,
+    load_project_files,
+    materialize_project,
+    normalize_file_path,
+    persist_workspace,
+    save_generated_file,
+)
 
 PYTHON = sys.executable
 
 PROJECTS_DIR = settings.GENERATED_PROJECTS_DIR
 
 _running_processes = {}
+
+
+def _resolve_project(project_id):
+    value = str(project_id)
+    if value.startswith("project_"):
+        value = value.removeprefix("project_")
+    if not value.isdigit():
+        return None
+    return Project.objects.filter(pk=int(value)).first()
+
+
+def _project_workspace(project_id, materialize=False):
+    project = _resolve_project(project_id)
+    if project is None:
+        return None, None
+    project_dir = os.path.join(PROJECTS_DIR, f"project_{project.pk}")
+    persisted = load_project_files(project)
+    if not persisted and os.path.isdir(project_dir):
+        # One-time migration for workspaces created before database persistence.
+        persisted = persist_workspace(project, project_dir)
+    if materialize:
+        materialize_project(project, project_dir, clear=True)
+    return project, project_dir
 
 
 def _format_command(command):
@@ -320,34 +352,29 @@ def _stop_process(project_id):
 
 @api_view(["GET"])
 def list_projects(request):
-    if not os.path.exists(PROJECTS_DIR):
-        return Response([])
-
     projects = []
-    for name in sorted(os.listdir(PROJECTS_DIR)):
-        path = os.path.join(PROJECTS_DIR, name)
-        if os.path.isdir(path):
-            files = _list_files(path)
-            projects.append({
-                "id": name,
-                "name": name.replace("project_", "Project "),
-                "path": path,
-                "files": files,
-                "file_count": len(files),
-            })
+    for project in Project.objects.all().order_by("id"):
+        files = load_project_files(project)
+        projects.append({
+            "id": f"project_{project.pk}",
+            "name": project.name,
+            "path": os.path.join(PROJECTS_DIR, f"project_{project.pk}"),
+            "files": [{"path": path, "size": len(content.encode("utf-8"))} for path, content in files.items()],
+            "file_count": len(files),
+        })
 
     return Response(projects)
 
 
 @api_view(["GET"])
 def project_files(request, project_id):
-    project_dir = os.path.join(PROJECTS_DIR, project_id)
-    if not os.path.exists(project_dir):
+    project, project_dir = _project_workspace(project_id)
+    if project is None:
         return Response(
             {"error": "Project not found"}, status=status.HTTP_404_NOT_FOUND
         )
 
-    files = _list_files(project_dir)
+    files = [{"path": path, "size": len(content.encode("utf-8"))} for path, content in load_project_files(project).items()]
     return Response({"project_id": project_id, "files": files})
 
 
@@ -357,7 +384,13 @@ def read_file(request, project_id):
     if not file_path:
         return Response({"error": "file_path parameter required"}, status=status.HTTP_400_BAD_REQUEST)
 
-    project_dir = os.path.join(PROJECTS_DIR, project_id)
+    project, project_dir = _project_workspace(project_id)
+    if project is None:
+        return Response({"error": "Project not found"}, status=status.HTTP_404_NOT_FOUND)
+    try:
+        file_path = normalize_file_path(file_path)
+    except ValueError:
+        return Response({"error": "Invalid path"}, status=status.HTTP_400_BAD_REQUEST)
     full_path = os.path.normpath(os.path.join(project_dir, file_path))
 
     if not full_path.startswith(os.path.normpath(project_dir)):
@@ -365,26 +398,21 @@ def read_file(request, project_id):
             {"error": "Invalid path"}, status=status.HTTP_400_BAD_REQUEST
         )
 
-    if not os.path.exists(full_path):
+    persisted_files = load_project_files(project)
+    if file_path not in persisted_files:
         return Response(
             {"error": "File not found"}, status=status.HTTP_404_NOT_FOUND
         )
 
-    try:
-        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except Exception as e:
-        return Response(
-            {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+    content = persisted_files[file_path]
 
     return Response({"path": file_path, "content": content})
 
 
 @api_view(["POST"])
 def run_project(request, project_id):
-    project_dir = os.path.join(PROJECTS_DIR, project_id)
-    if not os.path.exists(project_dir):
+    project, project_dir = _project_workspace(project_id, materialize=True)
+    if project is None:
         return Response(
             {"error": "Project not found"}, status=status.HTTP_404_NOT_FOUND
         )
@@ -496,25 +524,15 @@ def run_status(request, project_id):
 
 @api_view(["POST"])
 def modify_project(request, project_id):
-    project_dir = os.path.join(PROJECTS_DIR, project_id)
-    if not os.path.exists(project_dir):
+    project, project_dir = _project_workspace(project_id)
+    if project is None:
         return Response({"error": "Project not found"}, status=status.HTTP_404_NOT_FOUND)
 
     modification = request.data.get("modification")
     if not modification:
         return Response({"error": "modification parameter required"}, status=status.HTTP_400_BAD_REQUEST)
 
-    source_files = {}
-    for dirpath, dirnames, filenames in os.walk(project_dir):
-        dirnames[:] = [d for d in dirnames if d not in {"__pycache__", "node_modules", ".git", ".venv"}]
-        for fname in filenames:
-            full_path = os.path.join(dirpath, fname)
-            rel_path = os.path.relpath(full_path, project_dir)
-            try:
-                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                    source_files[rel_path] = f.read()
-            except Exception:
-                pass
+    source_files = load_project_files(project)
 
     try:
         result = gemini_ai.modify_project(source_files, modification)
@@ -545,27 +563,19 @@ def modify_project(request, project_id):
     changed_files = []
     all_files = result.get("files", {})
     for fname, content in all_files.items():
-        fpath = os.path.join(project_dir, fname)
-        os.makedirs(os.path.dirname(fpath) if os.path.dirname(fpath) else project_dir, exist_ok=True)
-        with open(fpath, "w", encoding="utf-8") as f:
-            f.write(content)
+        save_generated_file(project, fname, content)
         changed_files.append(fname)
 
     new_files = result.get("new_files", {})
     for fname, content in new_files.items():
-        fpath = os.path.join(project_dir, fname)
-        os.makedirs(os.path.dirname(fpath) if os.path.dirname(fpath) else project_dir, exist_ok=True)
-        with open(fpath, "w", encoding="utf-8") as f:
-            f.write(content)
+        save_generated_file(project, fname, content)
         changed_files.append(fname)
 
     for fname in result.get("deleted_files", []):
-        fpath = os.path.join(project_dir, fname)
-        if os.path.exists(fpath):
-            os.remove(fpath)
-            changed_files.append(f"deleted:{fname}")
+        delete_generated_file(project, fname)
+        changed_files.append(f"deleted:{fname}")
 
-    files = _list_files(project_dir)
+    files = _serialized_project_files(project)
     return Response({
         "summary": result.get("summary", ""),
         "changed_files": changed_files,
@@ -575,8 +585,8 @@ def modify_project(request, project_id):
 
 @api_view(["PUT"])
 def save_file(request, project_id):
-    project_dir = os.path.join(PROJECTS_DIR, project_id)
-    if not os.path.exists(project_dir):
+    project, project_dir = _project_workspace(project_id)
+    if project is None:
         return Response({"error": "Project not found"}, status=status.HTTP_404_NOT_FOUND)
 
     file_path = request.data.get("file_path")
@@ -584,28 +594,21 @@ def save_file(request, project_id):
     if not file_path or content is None:
         return Response({"error": "file_path and content required"}, status=status.HTTP_400_BAD_REQUEST)
 
-    full_path = os.path.normpath(os.path.join(project_dir, file_path))
-    if not full_path.startswith(os.path.normpath(project_dir)):
+    try:
+        file_path = normalize_file_path(file_path)
+    except ValueError:
         return Response({"error": "Invalid path"}, status=status.HTTP_400_BAD_REQUEST)
+    save_generated_file(project, file_path, content)
 
-    os.makedirs(os.path.dirname(full_path) if os.path.dirname(full_path) else project_dir, exist_ok=True)
-    with open(full_path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    files = _list_files(project_dir)
+    files = _serialized_project_files(project)
     return Response({"status": "saved", "path": file_path, "files": files})
 
 
-def _list_files(root):
-    files = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in {"__pycache__", "node_modules", ".git", ".venv"}]
-        for fname in filenames:
-            full_path = os.path.join(dirpath, fname)
-            rel_path = os.path.relpath(full_path, root)
-            size = os.path.getsize(full_path)
-            files.append({"path": rel_path, "size": size})
-    return sorted(files, key=lambda x: x["path"])
+def _serialized_project_files(project):
+    return [
+        {"path": path, "size": len(content.encode("utf-8"))}
+        for path, content in load_project_files(project).items()
+    ]
 
 
 def _find_run_script(project_dir):

@@ -50,3 +50,28 @@ class Project(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class GeneratedFile(models.Model):
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.CASCADE,
+        related_name="generated_files",
+    )
+    path = models.CharField(max_length=1024)
+    content = models.TextField()
+    content_hash = models.CharField(max_length=64, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["path"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "path"],
+                name="unique_generated_file_per_project",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.project_id}/{self.path}"

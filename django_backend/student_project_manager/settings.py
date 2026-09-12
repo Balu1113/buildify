@@ -1,15 +1,16 @@
 import os
 from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
-GENERATED_PROJECTS_DIR = os.path.abspath(
-    os.getenv("GENERATED_PROJECTS_DIR", str(BASE_DIR.parent / "generated_projects"))
-)
 
 from dotenv import load_dotenv
 
 load_dotenv(BASE_DIR.parent.parent.parent / ".env")
 load_dotenv(BASE_DIR.parent.parent / ".env", override=False)
 load_dotenv(BASE_DIR.parent / ".env", override=False)
+
+GENERATED_PROJECTS_DIR = os.path.abspath(
+    os.getenv("GENERATED_PROJECTS_DIR", str(BASE_DIR.parent / "generated_projects"))
+)
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-change-me-in-production")
 
