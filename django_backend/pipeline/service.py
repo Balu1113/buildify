@@ -1442,6 +1442,9 @@ def _run_debugger(task, project, project_files, project_dir, test_result, pipeli
         truncated = content[:MAX_FILE_CONTENT]
         test_section += f"\n--- {fname} ---\n{truncated}\n"
 
+    workspace_inventory = _inspect_generated_workspace(project_dir)
+    inventory_section = _retry_context_text(workspace_inventory)
+
     acceptance_contract = acceptance_contract or _task_acceptance_contract(task)
     retry_context = retry_context or {"attempt": attempt}
     test_output = test_result.get("test_output", "No output available")
@@ -1470,6 +1473,9 @@ Description: {task.description}
 === TEST OUTPUT, STACK TRACE, AND FAILURES ===
 {test_output}
 
+=== ACTUAL GENERATED WORKSPACE INVENTORY ===
+{inventory_section}
+
 === INSTRUCTIONS ===
 Analyze the failing tests, stack traces, reviewer findings, and acceptance contract.
 Fix the actual source, test, or project configuration
@@ -1478,6 +1484,15 @@ tree and repair malformed, missing, inconsistent, or incompatible files instead
 of only suppressing the reported error. Return complete replacement file contents.
 Make targeted changes and resolve every applicable item in RETRY CONTEXT; do not
 rewrite unrelated parts of the project.
+
+For finalization failures, inspect this actual inventory and the complete workspace
+before editing. Keep the generated Django dependency graph consistent: manage.py,
+the discovered settings package, ROOT_URLCONF, included URL modules, INSTALLED_APPS,
+WSGI/ASGI modules, migrations, and requirements must all resolve to generated files.
+If an app URL module is missing, first determine whether the app exists. Add a real
+urls.py with valid urlpatterns only when that app is part of the generated project;
+otherwise correct the generated URL configuration to reference the actual app.
+Never create empty placeholder files, and never modify the Buildify host application.
 
 Common issues to check:
 1. Syntax errors in source or test files
@@ -1779,6 +1794,12 @@ def _generated_environment(project_dir, roots):
 
 def _generated_project_reference_violations(project_dir):
     """Find host-application references only inside the generated workspace."""
+    forbidden_tokens = (
+        HOST_DJANGO_PACKAGE,
+        "django_backend",
+        "student_project_manager.settings",
+        "student_project_manager.urls",
+    )
     violations = []
     for root, dirs, files in os.walk(project_dir):
         dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
@@ -1787,10 +1808,10 @@ def _generated_project_reference_violations(project_dir):
             try:
                 with open(path, "r", encoding="utf-8", errors="replace") as handle:
                     for line_number, line in enumerate(handle, 1):
-                        if HOST_DJANGO_PACKAGE in line:
+                        if any(token in line for token in forbidden_tokens):
                             relative = os.path.relpath(path, project_dir).replace(os.sep, "/")
                             violations.append(
-                                f"{relative}:{line_number} references host package {HOST_DJANGO_PACKAGE}"
+                                f"{relative}:{line_number} references a Buildify host module"
                             )
                             break
             except OSError:
@@ -1862,9 +1883,273 @@ def _discover_generated_django(project_dir):
     }
 
 
+def _module_file(project_dir, module_name, roots):
+    if not module_name or not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", module_name):
+        return None
+    parts = module_name.split(".")
+    for root in roots:
+        module_file = os.path.join(root, *parts) + ".py"
+        package_init = os.path.join(root, *parts, "__init__.py")
+        if os.path.isfile(module_file):
+            return module_file
+        if os.path.isfile(package_init):
+            return package_init
+    return None
+
+
+def _literal_assignment(tree, name, default=None):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name for target in node.targets
+        ):
+            try:
+                return ast.literal_eval(node.value)
+            except (ValueError, SyntaxError):
+                return default
+    return default
+
+
+def _inspect_generated_workspace(project_dir):
+    """Inventory the actual generated workspace before any finalization repair."""
+    files = {}
+    for root, dirs, names in os.walk(project_dir):
+        dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
+        for name in names:
+            path = os.path.join(root, name)
+            files[os.path.relpath(path, project_dir).replace(os.sep, "/")] = path
+
+    descriptor = _discover_generated_django(project_dir)
+    backend_dir = descriptor.get("backend_dir")
+    package_root = descriptor.get("package_root") or backend_dir or project_dir
+    settings_path = descriptor.get("settings_path")
+    settings_data = {
+        "installed_apps": [],
+        "root_urlconf": None,
+        "wsgi_application": None,
+        "asgi_application": None,
+    }
+    if settings_path:
+        try:
+            with open(settings_path, "r", encoding="utf-8", errors="replace") as handle:
+                settings_tree = ast.parse(handle.read())
+            settings_data = {
+                "installed_apps": _literal_assignment(settings_tree, "INSTALLED_APPS", []) or [],
+                "root_urlconf": _literal_assignment(settings_tree, "ROOT_URLCONF"),
+                "wsgi_application": _literal_assignment(settings_tree, "WSGI_APPLICATION"),
+                "asgi_application": _literal_assignment(settings_tree, "ASGI_APPLICATION"),
+            }
+        except (OSError, SyntaxError):
+            pass
+
+    app_packages = []
+    app_url_modules = []
+    for app in settings_data["installed_apps"]:
+        if not isinstance(app, str) or app.startswith("django.") or app in {"rest_framework", "corsheaders"}:
+            continue
+        app_file = _module_file(project_dir, app, [package_root, project_dir])
+        if app_file:
+            app_packages.append(app)
+            app_url_modules.append(f"{app}.urls")
+
+    return {
+        "files": sorted(files),
+        "manage_py": os.path.relpath(descriptor["manage_path"], project_dir).replace(os.sep, "/") if descriptor.get("manage_path") else None,
+        "django_package": descriptor.get("settings_module", "").rsplit(".", 1)[0] if descriptor.get("settings_module") else None,
+        "settings_module": descriptor.get("settings_module"),
+        "settings_py": os.path.relpath(settings_path, project_dir).replace(os.sep, "/") if settings_path else None,
+        "urls_py": os.path.relpath(_module_file(project_dir, settings_data["root_urlconf"], [package_root, project_dir]), project_dir).replace(os.sep, "/") if _module_file(project_dir, settings_data["root_urlconf"], [package_root, project_dir]) else None,
+        "wsgi_py": _module_file(project_dir, settings_data["wsgi_application"], [package_root, project_dir]),
+        "asgi_py": _module_file(project_dir, settings_data["asgi_application"], [package_root, project_dir]),
+        "installed_apps": settings_data["installed_apps"],
+        "resolved_app_packages": app_packages,
+        "app_url_modules": app_url_modules,
+        "models_py": [path for path in files if path.endswith("/models.py") or path == "models.py"],
+        "migrations": [path for path in files if "/migrations/" in path or path.startswith("migrations/")],
+        "app_urls_py": [path for path in files if path.endswith("/urls.py") or path == "urls.py"],
+        "requirements": [path for path in files if path.endswith("requirements.txt")],
+        "frontend_package_json": [path for path in files if path.endswith("package.json")],
+        "backend_dir": backend_dir,
+        "descriptor": descriptor,
+    }
+
+
+def _generated_consistency_findings(project_dir, inventory=None):
+    """Validate the generated Django dependency graph before process execution."""
+    inventory = inventory or _inspect_generated_workspace(project_dir)
+    descriptor = inventory["descriptor"]
+    findings = []
+    if descriptor.get("errors"):
+        findings.extend({
+            "check_name": "Generated Django project consistency",
+            "failure_type": "missing_or_invalid_structure",
+            "exact_error": error,
+            "affected_path_or_module": descriptor.get("settings_module"),
+            "severity": "critical",
+            "recommended_repair": "Inspect the generated workspace and make manage.py, package files, and settings references consistent.",
+        } for error in descriptor["errors"])
+        return findings
+
+    settings_path = inventory.get("settings_py")
+    settings_module = inventory.get("settings_module")
+    package_root = descriptor.get("package_root") or descriptor.get("backend_dir") or project_dir
+    roots = [descriptor.get("backend_dir"), package_root, project_dir]
+    if settings_path:
+        with open(os.path.join(project_dir, settings_path), encoding="utf-8", errors="replace") as handle:
+            settings_source = handle.read()
+        try:
+            settings_tree = ast.parse(settings_source)
+        except SyntaxError as error:
+            return [{
+                "check_name": "Generated Django project consistency",
+                "failure_type": "syntax_error",
+                "exact_error": str(error),
+                "affected_path_or_module": settings_path,
+                "severity": "critical",
+                "recommended_repair": "Fix settings.py syntax before validating its dependency graph.",
+            }]
+        expected_root = _literal_assignment(settings_tree, "ROOT_URLCONF")
+        for name, module in (("ROOT_URLCONF", expected_root), ("WSGI_APPLICATION", _literal_assignment(settings_tree, "WSGI_APPLICATION")), ("ASGI_APPLICATION", _literal_assignment(settings_tree, "ASGI_APPLICATION"))):
+            module_name = module.rsplit(".", 1)[0] if isinstance(module, str) and name != "ROOT_URLCONF" else module
+            if not _module_file(project_dir, module_name, roots):
+                findings.append({
+                    "check_name": "Generated Django project consistency",
+                    "failure_type": "missing_module",
+                    "exact_error": f"{name} references missing module {module}",
+                    "affected_path_or_module": module,
+                    "severity": "critical",
+                    "recommended_repair": "Correct the generated module reference or create the complete referenced module within the generated package.",
+                })
+        installed_apps = _literal_assignment(settings_tree, "INSTALLED_APPS", []) or []
+        for app in installed_apps:
+            if isinstance(app, str) and not app.startswith("django.") and app not in {"rest_framework", "corsheaders"} and not _module_file(project_dir, app, roots):
+                findings.append({
+                    "check_name": "Generated Django consistency",
+                    "failure_type": "missing_installed_app",
+                    "exact_error": f"INSTALLED_APPS references missing package {app}",
+                    "affected_path_or_module": app,
+                    "severity": "critical",
+                    "recommended_repair": "Use an existing generated app package or create its complete package, URLs, models, and migrations.",
+                })
+        root_url_module = _literal_assignment(settings_tree, "ROOT_URLCONF")
+        root_url_path = _module_file(project_dir, root_url_module, roots)
+        if root_url_path:
+            try:
+                with open(root_url_path, encoding="utf-8", errors="replace") as url_file:
+                    url_tree = ast.parse(url_file.read())
+                referenced_urls = set()
+                for node in ast.walk(url_tree):
+                    if isinstance(node, ast.ImportFrom) and node.module:
+                        referenced_urls.add(node.module)
+                    elif isinstance(node, ast.Import):
+                        referenced_urls.update(alias.name for alias in node.names)
+                    elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "include" and node.args:
+                        if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                            referenced_urls.add(node.args[0].value)
+                for module in sorted(referenced_urls):
+                    if module.startswith("django") or module.startswith("rest_framework"):
+                        continue
+                    if not _module_file(project_dir, module, roots):
+                        findings.append({
+                            "check_name": "Generated URL dependency graph",
+                            "failure_type": "missing_url_module",
+                            "exact_error": f"URL configuration references missing module {module}",
+                            "affected_path_or_module": module,
+                            "severity": "critical",
+                            "recommended_repair": "Inspect the generated app structure and either add a complete urls.py with valid urlpatterns or reference the existing generated URL module.",
+                        })
+            except (OSError, SyntaxError) as error:
+                findings.append({
+                    "check_name": "Generated URL dependency graph",
+                    "failure_type": "url_configuration_error",
+                    "exact_error": str(error),
+                    "affected_path_or_module": root_url_module,
+                    "severity": "critical",
+                    "recommended_repair": "Repair the generated root URL configuration before changing unrelated files.",
+                })
+        for app in installed_apps:
+            if not isinstance(app, str) or app.startswith("django."):
+                continue
+            app_path = _module_file(project_dir, app, roots)
+            if app_path and os.path.isdir(os.path.dirname(app_path)) and not os.path.isdir(os.path.join(os.path.dirname(app_path), "migrations")):
+                findings.append({
+                    "check_name": "Generated migrations structure",
+                    "failure_type": "missing_migrations_package",
+                    "exact_error": f"Installed app {app} has no migrations/ package",
+                    "affected_path_or_module": app,
+                    "severity": "major",
+                    "recommended_repair": "Add a real migrations package for the generated app or remove the app from INSTALLED_APPS if it is not an app.",
+                })
+        if settings_module and settings_module.startswith(HOST_DJANGO_PACKAGE):
+            findings.append({
+                "check_name": "Generated-project isolation",
+                "failure_type": "host_module_reference",
+                "exact_error": f"Generated settings module points to {settings_module}",
+                "affected_path_or_module": settings_module,
+                "severity": "critical",
+                "recommended_repair": "Use a unique generated Django package instead of the Buildify host package.",
+            })
+    if not inventory["requirements"]:
+        findings.append({
+            "check_name": "Backend dependency file",
+            "failure_type": "missing_dependency_file",
+            "exact_error": "No requirements.txt found for generated backend",
+            "affected_path_or_module": "requirements.txt",
+            "severity": "major",
+            "recommended_repair": "Add the generated backend requirements file with Django and required imported packages.",
+        })
+    if inventory.get("manage_py") and not inventory.get("models_py"):
+        findings.append({
+            "check_name": "Generated Django structure",
+            "failure_type": "missing_models_file",
+            "exact_error": "Generated Django project has no models.py file",
+            "affected_path_or_module": inventory.get("django_package"),
+            "severity": "minor",
+            "recommended_repair": "Inspect the generated apps; add models.py only for an app that requires models, without creating placeholders.",
+        })
+    else:
+        requirements_text = "\n".join(
+            open(os.path.join(project_dir, path), encoding="utf-8", errors="replace").read()
+            for path in inventory["requirements"]
+        ).lower()
+        if inventory.get("manage_py") and "django" not in requirements_text:
+            findings.append({
+                "check_name": "Backend dependency file",
+                "failure_type": "missing_required_dependency",
+                "exact_error": "Generated requirements.txt does not contain Django",
+                "affected_path_or_module": "requirements.txt",
+                "severity": "major",
+                "recommended_repair": "Add Django and the packages imported by the generated backend.",
+            })
+    if inventory["frontend_package_json"]:
+        for package_path in inventory["frontend_package_json"]:
+            try:
+                package = json.loads(open(os.path.join(project_dir, package_path), encoding="utf-8").read())
+            except (OSError, json.JSONDecodeError) as error:
+                findings.append({
+                    "check_name": "Frontend package.json",
+                    "failure_type": "invalid_package_manifest",
+                    "exact_error": str(error),
+                    "affected_path_or_module": package_path,
+                    "severity": "major",
+                    "recommended_repair": "Repair the generated frontend package manifest without changing backend files.",
+                })
+            else:
+                if "react" in json.dumps(package).lower() and not package.get("scripts", {}).get("build"):
+                    findings.append({
+                        "check_name": "Frontend package.json",
+                        "failure_type": "missing_build_script",
+                        "exact_error": "React package.json has no build script",
+                        "affected_path_or_module": package_path,
+                        "severity": "major",
+                        "recommended_repair": "Add the appropriate generated frontend build script.",
+                    })
+    return findings
+
+
 def _validate_project_locally(project_dir):
     """Run the generated app's own backend and frontend build gates."""
     checks = []
+    inventory = _inspect_generated_workspace(project_dir)
     project_files = []
     if os.path.isdir(project_dir):
         for root, dirs, files in os.walk(project_dir):
@@ -1882,7 +2167,17 @@ def _validate_project_locally(project_dir):
         "output": "\n".join(host_references) or "No Buildify host application references found",
     })
 
-    django_project = _discover_generated_django(project_dir)
+    consistency_findings = _generated_consistency_findings(project_dir, inventory)
+    checks.append({
+        "name": "Generated dependency graph",
+        "passed": not consistency_findings,
+        "output": "\n".join(
+            f"{finding['failure_type']}: {finding['exact_error']}"
+            for finding in consistency_findings
+        ) or "Generated Django dependency graph is internally consistent",
+    })
+
+    django_project = inventory["descriptor"]
     manage_path = django_project.get("manage_path")
     if manage_path:
         try:
@@ -1920,7 +2215,7 @@ def _validate_project_locally(project_dir):
                 cwd=backend_dir, env=env, capture_output=True, text=True, timeout=180,
             )
             checks.append({"name": "Python compilation", "passed": compile_result.returncode == 0, "output": (compile_result.stdout + compile_result.stderr).strip()})
-            if not django_project.get("errors"):
+            if not django_project.get("errors") and not consistency_findings:
                 settings_import = subprocess.run(
                     [python, "-c", f"import {django_project['settings_module']}"],
                     cwd=backend_dir, env=env, capture_output=True,
@@ -2101,6 +2396,7 @@ def _run_finalization(pipeline, project, all_tasks, project_files, project_dir, 
         "reviewer_findings": [],
         "unresolved_issues": [],
         "attempt": 0,
+        "workspace_inventory": _inspect_generated_workspace(project_dir),
     }
 
     for attempt in range(1, FINALIZATION_REPAIR_ATTEMPTS + 1):
@@ -2137,6 +2433,7 @@ def _run_finalization(pipeline, project, all_tasks, project_files, project_dir, 
             return True
 
         findings = _acceptance_findings(acceptance)
+        retry_context["workspace_inventory"] = _inspect_generated_workspace(project_dir)
         retry_context["attempt"] = attempt
         retry_context["reviewer_findings"] = findings
         retry_context["unresolved_issues"] = findings
