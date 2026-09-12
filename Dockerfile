@@ -47,11 +47,11 @@ RUN mkdir -p \
     /app/django_backend/logs
 
 # Collect static files
-RUN python manage.py collectstatic --noinput || true
+RUN python manage.py collectstatic --noinput
 
 # ---------------------------------------------------------
 # Django/Gunicorn
 # ---------------------------------------------------------
 
 EXPOSE 8000
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8000} student_project_manager.wsgi:application"]
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8000} --access-logfile - --error-logfile - student_project_manager.wsgi:application"]
