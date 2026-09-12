@@ -155,6 +155,22 @@ def _get_run_command(project_dir, script, port=None):
     if script.endswith("package.json"):
         package_dir = os.path.dirname(os.path.join(project_dir, script))
         package_path = os.path.join(package_dir, "package.json")
+        
+        # Check for pre-built frontend (built during pipeline finalization)
+        for build_dir_name in ("dist", "build", "out"):
+            build_dir = os.path.join(package_dir, build_dir_name)
+            if os.path.isdir(build_dir):
+                # Serve pre-built app with a lightweight static server
+                # Use http.server for maximum compatibility (Python stdlib)
+                return [
+                    PYTHON,
+                    "-m",
+                    "http.server",
+                    str(port or 0),
+                    "--directory",
+                    build_dir,
+                ]
+        
         try:
             with open(package_path, "r", encoding="utf-8") as package_file:
                 package = json.load(package_file)
@@ -188,7 +204,13 @@ def _ensure_node_dependencies(project_dir, script):
     npm_command = shutil.which("npm.cmd" if os.name == "nt" else "npm")
 
     if npm_command is None:
-        return "tool_unavailable: npm"
+        return {
+            "status": "environment-unavailable",
+            "tool_unavailable": "npm",
+            "severity": "environment",
+            "error": "tool_unavailable: npm",
+            "message": "The generated frontend is structurally valid, but this server does not have Node.js/npm installed.",
+        }
 
     try:
         result = subprocess.run(
@@ -699,7 +721,14 @@ def project_chat(request, project_id):
             apply_changes=apply_changes,
         )
     except gemini_ai.GeminiAPIError as error:
-        return Response({"error": str(error), "detail": str(error)}, status=error.status_code)
+        return Response(
+            {
+                "error": str(error),
+                "detail": str(error),
+                "code": "ai_provider_error",
+            },
+            status=error.status_code if isinstance(error.status_code, int) and 400 <= error.status_code <= 599 else status.HTTP_502_BAD_GATEWAY,
+        )
     if not result:
         return Response({"error": "Project chat failed"}, status=status.HTTP_502_BAD_GATEWAY)
 

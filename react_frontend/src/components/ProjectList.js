@@ -381,6 +381,9 @@ const ProjectList = () => {
         startRunPolling();
         return true;
       }
+      if (r.data.status === "environment-unavailable") {
+        showToast("Preview unavailable: Node.js/npm is not installed on the server.", "info");
+      }
     } catch (err) {
       setRunState({ status: "idle", port: null });
       const data = err.response?.data;

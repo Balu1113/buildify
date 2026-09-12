@@ -17,7 +17,16 @@ RUN apt-get update && apt-get install -y \
     libffi-dev \
     libpango1.0-dev \
     libgirepository1.0-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------
+# Node.js / npm (for building generated React frontends)
+# ---------------------------------------------------------
+
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------
 # Python dependencies
