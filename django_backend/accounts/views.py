@@ -40,16 +40,35 @@ class LoginView(APIView):
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = authenticate(
-            username=serializer.validated_data["username"],
-            password=serializer.validated_data["password"],
-        )
+        try:
+            user = authenticate(
+                username=serializer.validated_data["username"],
+                password=serializer.validated_data["password"],
+            )
+            print("AUTHENTICATE RESULT:", user)
+        except Exception as e:
+            import traceback
+            print("AUTHENTICATE ERROR:", repr(e))
+            traceback.print_exc()
+            return Response(
+                {"error": "Authentication failed", "detail": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
         if user is None:
             return Response(
                 {"error": "Invalid credentials."},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
-        refresh = RefreshToken.for_user(user)
+        try:
+            refresh = RefreshToken.for_user(user)
+        except Exception as e:
+            import traceback
+            print("TOKEN ERROR:", repr(e))
+            traceback.print_exc()
+            return Response(
+                {"error": "Token generation failed", "detail": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
         return Response(
             {
                 "user": UserSerializer(user).data,
