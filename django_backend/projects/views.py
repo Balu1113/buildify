@@ -9,9 +9,7 @@ from .models import Project
 from .serializers import ProjectSerializer
 
 
-GENERATED_PROJECTS_ROOT = os.path.abspath(
-    os.path.join(settings.BASE_DIR, "..", "..", "generated_projects")
-)
+GENERATED_PROJECTS_ROOT = settings.GENERATED_PROJECTS_DIR
 
 
 def _remove_orphaned_workspaces():

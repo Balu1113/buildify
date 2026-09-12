@@ -16,7 +16,7 @@ from . import gemini_ai
 
 PYTHON = sys.executable
 
-PROJECTS_DIR = os.path.join(settings.BASE_DIR, "..", "generated_projects")
+PROJECTS_DIR = settings.GENERATED_PROJECTS_DIR
 
 _running_processes = {}
 

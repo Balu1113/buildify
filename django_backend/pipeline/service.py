@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 from django.conf import settings
 
-PROJECT_ROOT = os.path.join(settings.BASE_DIR, "..")
+PROJECT_ROOT = os.path.abspath(settings.BASE_DIR.parent)
 sys.path.insert(0, PROJECT_ROOT)
 
 from openai import OpenAI
@@ -585,7 +585,10 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
 
         pipeline.append_log(f"Pipeline started for project: {project.name}")
         pipeline.append_log(f"Description: {project.description}")
-        project_dir = os.path.join(PROJECT_ROOT, "generated_projects", f"project_{project.id}")
+        project_dir = os.path.join(
+            settings.GENERATED_PROJECTS_DIR,
+            f"project_{project.id}",
+        )
 
         # Planning belongs to the pipeline so the UI can show it and task creation
         # happens before the development stages begin.

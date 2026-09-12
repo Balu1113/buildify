@@ -1,6 +1,9 @@
 import os
 from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
+GENERATED_PROJECTS_DIR = os.path.abspath(
+    os.getenv("GENERATED_PROJECTS_DIR", str(BASE_DIR.parent / "generated_projects"))
+)
 
 from dotenv import load_dotenv
 
