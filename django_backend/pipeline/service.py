@@ -275,11 +275,15 @@ def validate_imports(source_code: str, available_symbols: dict) -> list:
     return warnings
 
 
+def _is_package_initializer(filepath: str) -> bool:
+    return filepath.replace("\\", "/").rsplit("/", 1)[-1] == "__init__.py"
+
+
 def verify_file_content(filepath: str, content: str) -> dict:
     """Verify a generated file. Returns dict with valid, errors, warnings."""
     result = {"valid": True, "errors": [], "warnings": []}
 
-    if not content.strip() and not filepath.replace("\\", "/").endswith("/__init__.py"):
+    if not content.strip() and not _is_package_initializer(filepath):
         result["valid"] = False
         result["errors"].append("Empty file content")
         return result
@@ -492,7 +496,9 @@ def _run_pipeline_worker(project_id):
                     # Verify and write files
                     verification_errors = []
                     for fname, content in new_files.items():
-                        if not content or not content.strip():
+                        if (
+                            not content or not content.strip()
+                        ) and not _is_package_initializer(fname):
                             verification_errors.append(f"{fname}: empty content")
                             continue
 
@@ -897,6 +903,11 @@ CRITICAL RULES:
 
 4. **Database**: Use SQLite for development. The DATABASES setting should have a 'default' key with 'ENGINE' and 'NAME' keys. Use BASE_DIR from pathlib for the database path. Do not use f-strings for dictionary literals.
 
+    The default SQLite NAME must be BASE_DIR / 'db.sqlite3'. Do not read
+    DATABASE_NAME or replace this path with ':memory:'. The pipeline runs
+    pytest against the project's real settings, so tests must not assume a
+    separate pipeline settings module or a different database path.
+
 5. **SECRET_KEY**: Always read from environment: SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-dev-key-change-in-prod')
 
 6. **settings.py must include ALL required middleware** in this order:
@@ -923,6 +934,11 @@ CRITICAL RULES:
    django.setup()
 
 10. **React frontend**: Place at frontend/ with standard create-react-app or Vite structure. Never mix frontend files into backend/.
+
+11. **Mobile compatibility**: Frontend pages must be responsive from 320px
+    through desktop widths. Use flexible layouts, readable touch-sized controls,
+    responsive tables or cards, and viewport-safe typography. Do not require
+    horizontal scrolling for the primary workflow.
 
 === DJANGO VIEWS - CRITICAL RULES ===
 For class-based views in Django:
@@ -1064,6 +1080,11 @@ DJANGO TEST RULES (apply whenever the project uses Django):
 
 6. Import apps as 'apps.<appname>.models' not '<appname>.models'.
    Example: from apps.calculator.models import Calculation
+
+7. Tests must load the project's normal settings module and must not set
+    DATABASE_NAME=:memory: or create a competing settings override. The
+    configured development database remains BASE_DIR / 'db.sqlite3'; Django's
+    test database handling provides test isolation.
 """
 
     generation_started = time.monotonic()
@@ -1171,10 +1192,15 @@ D. **DJANGO_SETTINGS_MODULE not set / ImportError on config.settings**
      DJANGO_SETTINGS_MODULE = config.settings
      pythonpath = backend
 
-E. **Import from wrong app path** (e.g., from calculator.models import X not found)
+E. **Database path differs between settings and tests**
+    Fix: Use the project's normal settings module. The default SQLite database
+    must remain BASE_DIR / 'db.sqlite3'; do not add DATABASE_NAME=:memory: or
+    create pipeline-specific settings to hide a configuration mismatch.
+
+F. **Import from wrong app path** (e.g., from calculator.models import X not found)
    Fix: Always import as from apps.<appname>.models import X
 
-F. **Invalid format specifier error**
+G. **Invalid format specifier error**
    Root cause: f-strings with curly braces inside single quotes like f"{{'key': 'value'}}" or f"{{'ENGINE': 'django.db.backends.sqlite3'}}"
    Fix: NEVER wrap dictionary literals in f-strings. Write dictionaries directly without f-string syntax. For Django settings, always use regular string quotes for dictionary keys and values, not f-strings.
 
@@ -1249,6 +1275,10 @@ Evaluate the implementation on:
 3. **Code Quality** (0-2): Is it readable, well-structured, following conventions?
 4. **Error Handling** (0-2): Are errors handled gracefully?
 5. **Best Practices** (0-2): Follows framework conventions, proper patterns?
+6. **Configuration and mobile compatibility**: Confirm Django uses the
+    project's configured BASE_DIR / 'db.sqlite3' default without a hidden
+    DATABASE_NAME=:memory: override, and confirm frontend workflows remain
+    usable at mobile widths with responsive layouts and touch-sized controls.
 
 Return ONLY valid JSON:
 {{
@@ -1297,6 +1327,7 @@ def _execute_pytest(project_dir):
         project_python = _project_python(project_dir)
         env = os.environ.copy()
         env["PIPELINE_LOCAL"] = "1"
+        env.pop("DATABASE_NAME", None)
         env.setdefault("DATABASE_ENGINE", "sqlite3")
         env.setdefault("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
         python_paths = [project_dir]
@@ -1309,9 +1340,6 @@ def _execute_pytest(project_dir):
         env["PYTHONPATH"] = os.pathsep.join(python_paths)
         django_settings = _find_generated_settings_module(project_dir, backend_dir)
         if django_settings:
-            django_settings = _create_test_settings_module(
-                project_dir, backend_dir, django_settings
-            )
             env["DJANGO_SETTINGS_MODULE"] = django_settings
         else:
             env.pop("DJANGO_SETTINGS_MODULE", None)
@@ -1501,37 +1529,6 @@ def _find_generated_settings_module(project_dir, backend_dir):
             if parts[-1] == "settings":
                 return ".".join(parts)
     return None
-
-
-def _create_test_settings_module(project_dir, backend_dir, django_settings):
-    """Create SQLite-backed settings for generated Django project tests."""
-    if not django_settings.endswith(".settings"):
-        return django_settings
-
-    package = django_settings.rsplit(".", 1)[0]
-    relative_path = os.path.join(*package.split("."), "pipeline_test_settings.py")
-    search_roots = [backend_dir, project_dir] if os.path.isdir(backend_dir) else [project_dir]
-
-    for root in search_roots:
-        settings_dir = os.path.dirname(os.path.join(root, relative_path))
-        source_settings = os.path.join(settings_dir, "settings.py")
-        if not os.path.isfile(source_settings):
-            continue
-
-        test_settings = os.path.join(settings_dir, "pipeline_test_settings.py")
-        with open(test_settings, "w", encoding="utf-8") as settings_file:
-            settings_file.write(
-                "from .settings import *\n\n"
-                "DATABASES = {\n"
-                "    'default': {\n"
-                "        'ENGINE': 'django.db.backends.sqlite3',\n"
-                "        'NAME': ':memory:',\n"
-                "    }\n"
-                "}\n"
-            )
-        return f"{package}.pipeline_test_settings"
-
-    return django_settings
 
 
 def _generate_project_readme(project, project_files, project_dir, model_name=None):
