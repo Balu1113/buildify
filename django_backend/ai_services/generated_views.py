@@ -132,7 +132,9 @@ def _get_run_command(project_dir, script, port=None):
         scripts = package.get("scripts", {})
         script_name = "dev" if "dev" in scripts else "start" if "start" in scripts else None
         if not script_name:
-            return [PYTHON, script]
+            raise RuntimeError(
+                f"{package_path} has no runnable 'dev' or 'start' script"
+            )
 
         npm_command = "npm.cmd" if os.name == "nt" else "npm"
         command = [npm_command, "run", script_name]
@@ -174,13 +176,13 @@ def _start_process(project_id, project_dir, script):
         _stop_process(project_id)
 
     scripts = [script]
-    frontend_script = os.path.join("frontend", "package.json")
+    frontend_script = script if script.endswith("package.json") else None
     backend_script = None
     for candidate in ("manage.py", os.path.join("backend", "manage.py"), os.path.join("server", "manage.py")):
         if os.path.exists(os.path.join(project_dir, candidate)):
             backend_script = candidate
             break
-    if script == frontend_script and backend_script:
+    if frontend_script and backend_script:
         scripts = [backend_script, frontend_script]
 
     processes = []
@@ -200,6 +202,10 @@ def _start_process(project_id, project_dir, script):
             env["FLASK_APP"] = "app.py"
             env["PYTHONDONTWRITEBYTECODE"] = "1"
             env.pop("DJANGO_SETTINGS_MODULE", None)
+            if current_script.endswith("manage.py"):
+                settings_module = _detect_settings_module(project_dir, current_script)
+                if settings_module:
+                    env["DJANGO_SETTINGS_MODULE"] = settings_module
 
             cwd = project_dir
             script_dir = os.path.dirname(current_script)
@@ -247,7 +253,7 @@ def _start_process(project_id, project_dir, script):
                 "command_display": _format_command(cmd),
             }
             processes.append(info)
-            if current_script == frontend_script:
+            if frontend_script and current_script == frontend_script:
                 frontend_info = info
     except Exception as error:
         for info in processes:
@@ -261,6 +267,37 @@ def _start_process(project_id, project_dir, script):
         "started_at": time.time(),
     }
     return {"port": _running_processes[project_id]["port"], "pid": _running_processes[project_id]["pid"]}, None
+
+
+def _detect_settings_module(project_dir, manage_script):
+    """Read the generated manage.py setting without importing Buildify settings."""
+    manage_path = os.path.join(project_dir, manage_script)
+    try:
+        with open(manage_path, "r", encoding="utf-8", errors="replace") as manage_file:
+            source = manage_file.read()
+    except OSError:
+        return None
+    match = re.search(
+        r"DJANGO_SETTINGS_MODULE\s*['\"]?\s*\]\s*=\s*['\"]([^'\"]+)['\"]",
+        source,
+    ) or re.search(
+        r"DJANGO_SETTINGS_MODULE['\"]?\s*,\s*['\"]([^'\"]+)['\"]",
+        source,
+    )
+    return match.group(1) if match else None
+
+
+def _wait_for_port(port, process, timeout=8):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if process.poll() is not None:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
 
 
 def _stop_process(project_id):
@@ -379,7 +416,7 @@ def run_project(request, project_id):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-    time.sleep(2)
+    time.sleep(0.5)
 
     proc_info = _running_processes.get(project_id)
     if proc_info:
@@ -400,6 +437,20 @@ def run_project(request, project_id):
                     ),
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        if not _wait_for_port(result["port"], proc_info["processes"][-1]["proc"]):
+            output = "\n".join(
+                "".join(process_info["output"][-30:])
+                for process_info in proc_info["processes"]
+            )
+            _stop_process(project_id)
+            return Response(
+                {
+                    "error": f"Preview process started but port {result['port']} did not become reachable",
+                    "output": output[-4000:],
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
             )
 
     return Response({
@@ -558,9 +609,20 @@ def _list_files(root):
 
 
 def _find_run_script(project_dir):
-    frontend_package = os.path.join(project_dir, "frontend", "package.json")
-    if os.path.exists(frontend_package):
-        return os.path.join("frontend", "package.json")
+    package_candidates = []
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [name for name in dirs if name not in {"node_modules", ".git", ".venv", "__pycache__"}]
+        if "package.json" in files:
+            package_candidates.append(os.path.relpath(os.path.join(root, "package.json"), project_dir))
+    for package_path in sorted(package_candidates):
+        try:
+            with open(os.path.join(project_dir, package_path), encoding="utf-8") as package_file:
+                package = json.load(package_file)
+        except (OSError, json.JSONDecodeError):
+            continue
+        scripts = package.get("scripts", {})
+        if "dev" in scripts or "start" in scripts:
+            return package_path
 
     if os.path.exists(os.path.join(project_dir, "manage.py")):
         return "manage.py"
