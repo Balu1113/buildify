@@ -9,6 +9,7 @@ import traceback
 import subprocess
 import shutil
 import hashlib
+from types import SimpleNamespace
 
 from django.conf import settings
 
@@ -136,6 +137,7 @@ from projects.models import Project
 MAX_RETRIES = 5
 MAX_FILE_CONTENT = 8000
 PROJECT_EXCLUDED_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
+HOST_DJANGO_PACKAGE = "student_project_manager"
 
 
 QUALITY_GATE_ENV = "BUILDIFY_QUALITY_GATES"
@@ -144,6 +146,13 @@ QUALITY_GATE_ENV = "BUILDIFY_QUALITY_GATES"
 def _task_acceptance_contract(task):
     """Build a structured, model-independent acceptance contract for every task."""
     description = (task.description or "").strip()
+    project_name = getattr(getattr(task, "project", None), "name", None) or "generated_project"
+    safe_name = re.sub(r"[^a-zA-Z0-9_]+", "_", project_name.lower()).strip("_") or "generated_project"
+    if safe_name[0].isdigit():
+        safe_name = f"project_{safe_name}"
+    generated_package = f"{safe_name}_backend"
+    if generated_package.startswith(HOST_DJANGO_PACKAGE):
+        generated_package = f"generated_{generated_package}"
     task_text = f"{task.title} {description}".lower()
     prohibited = [
         "Do not bypass, weaken, or remove tests to obtain a passing result.",
@@ -153,6 +162,7 @@ def _task_acceptance_contract(task):
         prohibited.append("Do not use eval(), Function(), new Function(), or equivalent dynamic code execution.")
     if any(keyword in task_text for keyword in ("api", "backend", "deployment", "configuration")):
         prohibited.append("Do not hardcode deployment endpoints or disable authentication and authorization.")
+    prohibited.append(f"Do not import or reference the Buildify host Django package: {HOST_DJANGO_PACKAGE}.")
     return {
         "version": 1,
         "task": {"id": getattr(task, "pk", None), "title": task.title, "description": description},
@@ -164,9 +174,11 @@ def _task_acceptance_contract(task):
         "security_requirements": [
             "Do not introduce arbitrary code execution, secret leakage, or unsafe input handling.",
             "Keep authentication, authorization, and user data scoped to the existing API contract.",
+            "Generated projects must be independently runnable and must not import or reference the Buildify host application.",
         ],
         "required_files_components": [
             "All source files, components, configuration, and API changes necessary for the stated requirements.",
+            f"For Django projects: use the deterministic independent package {generated_package} with manage.py, settings, URLs, WSGI/ASGI modules, apps, migrations, and dependencies.",
         ],
         "test_requirements": [
             "Test each stated functional requirement, important edge cases, and security-sensitive behavior.",
@@ -176,6 +188,7 @@ def _task_acceptance_contract(task):
             "All functional and contract requirements are implemented.",
             "Tests pass and no critical or major findings remain.",
             "Deterministic quality and security gates pass.",
+            "Generated Django configuration resolves only within the generated project workspace.",
         ],
         "prohibited_approaches": prohibited,
     }
@@ -537,12 +550,16 @@ def _repair_workspace(task, project, project_files, project_dir, pipeline, diagn
     return True
 
 
-def run_pipeline(project_id):
-    thread = threading.Thread(target=_run_pipeline_worker, args=(project_id,), daemon=True)
+def run_pipeline(project_id, pipeline_id=None):
+    thread = threading.Thread(
+        target=_run_pipeline_worker,
+        args=(project_id, pipeline_id),
+        daemon=True,
+    )
     thread.start()
 
 
-def _run_pipeline_worker(project_id):
+def _run_pipeline_worker(project_id, pipeline_id=None):
     pipeline = None
     try:
         project = Project.objects.get(id=project_id)
@@ -551,12 +568,20 @@ def _run_pipeline_worker(project_id):
             project.ai_model, project.ai_model
         ) or OPENAI_MODEL_NAME
 
-        pipeline = PipelineRun.objects.create(
-            project=project,
-            stage=PipelineRun.Stage.PLANNING,
-            total_tasks=0,
-            completed_tasks=0,
-        )
+        if pipeline_id:
+            pipeline = PipelineRun.objects.get(id=pipeline_id, project=project)
+            if pipeline.finalization_state == PipelineRun.FinalizationState.ACCEPTED:
+                pipeline.append_log("[Finalization] Project already accepted; no work rerun")
+                return
+            pipeline.error = ""
+            pipeline.save(update_fields=["error"])
+        else:
+            pipeline = PipelineRun.objects.create(
+                project=project,
+                stage=PipelineRun.Stage.PLANNING,
+                total_tasks=0,
+                completed_tasks=0,
+            )
 
         pipeline.append_log(f"Pipeline started for project: {project.name}")
         pipeline.append_log(f"Description: {project.description}")
@@ -597,8 +622,9 @@ def _run_pipeline_worker(project_id):
         pipeline.append_log(f"[Agents] Using selected model only: {selected_model}")
 
         tasks = [task for task in all_tasks if task.status != "done"]
-        pipeline.total_tasks = len(tasks)
-        pipeline.save(update_fields=["total_tasks"])
+        pipeline.total_tasks = len(all_tasks)
+        pipeline.completed_tasks = sum(1 for task in all_tasks if task.status == "done")
+        pipeline.save(update_fields=["total_tasks", "completed_tasks"])
         pipeline.append_log(f"Total tasks to process: {len(tasks)}")
 
         os.makedirs(project_dir, exist_ok=True)
@@ -989,56 +1015,34 @@ def _run_pipeline_worker(project_id):
             status__in=["todo", "in_progress"],
         ).count()
 
-        # Generate project-level files
-        pipeline.append_log("\n[Finalizing] Generating project metadata...")
+        if unfinished_tasks:
+            pipeline.finalization_state = PipelineRun.FinalizationState.PENDING
+            pipeline.stage = PipelineRun.Stage.FAILED
+            pipeline.error = "Tasks remain unfinished; finalization is pending"
+            pipeline.save(update_fields=["stage", "error", "finalization_state"])
+            pipeline.append_log("[Finalization] Deferred until all tasks are complete")
+            return
 
-        try:
-            _generate_project_readme(project, project_files, project_dir, selected_model)
-        except Exception as e:
-            pipeline.append_log(f"[Finalize] README generation failed: {e}")
-
-        acceptance = _validate_project_locally(project_dir)
-        for check in acceptance["checks"]:
-            pipeline.append_log(
-                f"[Acceptance] {check['name']}: {'PASSED' if check['passed'] else 'FAILED'}"
-            )
-            if not check["passed"]:
-                pipeline.append_log(f"[Acceptance] {check['output'][-2000:]}")
-
-        if not acceptance["passed"] and all_tasks:
-            acceptance_diagnostics = [
-                f"{check['name']}: {check['output']}"
-                for check in acceptance["checks"]
-                if not check["passed"]
-            ]
-            pipeline.stage = PipelineRun.Stage.DEBUGGING
-            pipeline.save(update_fields=["stage"])
-            pipeline.append_log("[Debugger] Repairing final acceptance failures...")
-            try:
-                repaired = _repair_workspace(
-                    all_tasks[-1], project, project_files, project_dir, pipeline,
-                    acceptance_diagnostics, selected_model,
-                )
-                if repaired:
-                    acceptance = _validate_project_locally(project_dir)
-                    pipeline.append_log(
-                        f"[Acceptance] Re-run after repair: {'PASSED' if acceptance['passed'] else 'FAILED'}"
-                    )
-            except Exception as repair_error:
-                pipeline.append_log(f"[Debugger] Final repair error: {repair_error}")
-
-        acceptance_failed = not acceptance["passed"]
-        pipeline.stage = (
-            PipelineRun.Stage.FAILED
-            if unfinished_tasks or acceptance_failed
-            else PipelineRun.Stage.COMPLETED
+        pipeline.append_log("\n[Finalizing] Running complete project acceptance...")
+        accepted = _run_finalization(
+            pipeline, project, all_tasks, project_files, project_dir, selected_model
         )
-        if acceptance_failed:
-            pipeline.error = "Generated project failed local acceptance checks"
-        pipeline.save(update_fields=["stage", "error"])
+        if accepted:
+            pipeline.append_log("[Finalizing] Generating project metadata...")
+            try:
+                _generate_project_readme(project, project_files, project_dir, selected_model)
+            except Exception as error:
+                pipeline.append_log(f"[Finalize] README generation failed: {error}")
+            pipeline.stage = PipelineRun.Stage.COMPLETED
+            pipeline.error = ""
+            pipeline.save(update_fields=["stage", "error"])
+        else:
+            pipeline.stage = PipelineRun.Stage.FAILED
+            pipeline.error = pipeline.error or "Generated project failed final acceptance"
+            pipeline.save(update_fields=["stage", "error"])
 
         pipeline.append_log(f"\n{'='*60}")
-        if unfinished_tasks or acceptance_failed:
+        if unfinished_tasks or not accepted:
             pipeline.append_log(
                 "PIPELINE FINISHED WITHOUT ACCEPTANCE"
             )
@@ -1138,6 +1142,15 @@ attempt {attempt + 1}, modify the current implementation and explicitly resolve
 EVERY unresolved issue, test failure, and reviewer finding in RETRY CONTEXT.
 Do not blindly regenerate the task from scratch. You must:
 
+DJANGO PROJECT ISOLATION:
+- If Django is required, derive a unique lowercase Python package name from the
+    project name (for example, <safe_project_name>_backend), and use it consistently
+    in manage.py, settings.py, urls.py, wsgi.py, and asgi.py.
+- Never use or import the Buildify host package {HOST_DJANGO_PACKAGE}, its settings,
+    URLs, apps, database, environment, or project name.
+- The generated project must run independently from its own root with its own
+    requirements.txt and database configuration.
+
 1. **Create all necessary files** for this task - models, views, serializers, URLs, templates, components, config files, etc.
 2. **Write COMPLETE code** - no placeholders, no "TODO", no "rest of code here", no "..." ellipsis
 3. **Use correct imports** - only import from files that exist in the project
@@ -1164,12 +1177,14 @@ CRITICAL RULES:
 - The JSON must be parseable by json.loads()
 
 === DJANGO-SPECIFIC RULES (follow strictly for any Django backend) ===
-1. **Project layout**: Always use this exact layout:
+1. **Project layout**: Use this layout with a unique generated package name,
+    never a host-application package:
    - backend/manage.py
-   - backend/config/__init__.py
-   - backend/config/settings.py  (ROOT_URLCONF = 'config.urls')
-   - backend/config/urls.py
-   - backend/config/wsgi.py
+    - backend/<generated_package>/__init__.py
+    - backend/<generated_package>/settings.py
+    - backend/<generated_package>/urls.py
+    - backend/<generated_package>/wsgi.py
+    - backend/<generated_package>/asgi.py
    - backend/apps/<appname>/__init__.py
    - backend/apps/<appname>/models.py
    - backend/apps/<appname>/views.py
@@ -1208,13 +1223,13 @@ CRITICAL RULES:
 
 8. **backend/pytest.ini**: Must contain:
    [pytest]
-   DJANGO_SETTINGS_MODULE = config.settings
+    DJANGO_SETTINGS_MODULE = <generated_package>.settings
    pythonpath = backend
 
 9. **tests/conftest.py**: Must set up Django before imports:
    import os, sys, django
    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
-   os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', '<generated_package>.settings')
    django.setup()
 
 10. **React frontend**: Place at frontend/ with standard create-react-app or Vite structure. Never mix frontend files into backend/.
@@ -1359,12 +1374,12 @@ DJANGO TEST RULES (apply whenever the project uses Django):
 1. Always generate tests/conftest.py if it does not already exist:
    import os, sys
    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
-   import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+    import os; os.environ.setdefault('DJANGO_SETTINGS_MODULE', '<generated_package>.settings')
    import django; django.setup()
 
 2. Always generate backend/pytest.ini if it does not already exist:
    [pytest]
-   DJANGO_SETTINGS_MODULE = config.settings
+    DJANGO_SETTINGS_MODULE = <generated_package>.settings
    pythonpath = backend
 
 3. Django model tests MUST use @pytest.mark.django_db decorator.
@@ -1490,14 +1505,14 @@ C. **RuntimeError: populate() called before django.setup() / Model imported too 
    Correct conftest.py:
      import os, sys
      sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
-     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', '<generated_package>.settings')
      import django
      django.setup()
 
-D. **DJANGO_SETTINGS_MODULE not set / ImportError on config.settings**
+D. **DJANGO_SETTINGS_MODULE not set / ImportError on generated settings**
    Fix: Ensure backend/pytest.ini contains:
      [pytest]
-     DJANGO_SETTINGS_MODULE = config.settings
+    DJANGO_SETTINGS_MODULE = <generated_package>.settings
      pythonpath = backend
 
 E. **Database path differs between settings and tests**
@@ -1649,20 +1664,13 @@ def _execute_pytest(project_dir):
     try:
         started_at = time.monotonic()
         project_python = _project_python(project_dir)
-        env = os.environ.copy()
-        env["PIPELINE_LOCAL"] = "1"
-        env.pop("DATABASE_NAME", None)
-        env.setdefault("DATABASE_ENGINE", "sqlite3")
-        env.setdefault("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
         python_paths = [project_dir]
         backend_dir = os.path.join(project_dir, "backend")
         if os.path.isdir(backend_dir):
             python_paths.insert(0, backend_dir)
-        existing_python_path = env.get("PYTHONPATH")
-        if existing_python_path:
-            python_paths.append(existing_python_path)
-        env["PYTHONPATH"] = os.pathsep.join(python_paths)
-        django_settings = _find_generated_settings_module(project_dir, backend_dir)
+        env = _generated_environment(project_dir, python_paths)
+        django_descriptor = _discover_generated_django(project_dir)
+        django_settings = django_descriptor.get("settings_module")
         if django_settings:
             env["DJANGO_SETTINGS_MODULE"] = django_settings
         else:
@@ -1749,29 +1757,160 @@ def _execute_pytest(project_dir):
         return {"passed": False, "output": f"Test execution error: {e}"}
 
 
-def _validate_project_locally(project_dir):
-    """Run the generated app's own backend and frontend build gates."""
-    checks = []
+def _generated_environment(project_dir, roots):
+    """Create a subprocess environment that cannot inherit host Django config."""
     env = os.environ.copy()
+    for key in tuple(env):
+        if (
+            key == "DJANGO_SETTINGS_MODULE"
+            or key.startswith("DJANGO_")
+            or key.startswith("DATABASE_")
+            or key in {"DATABASE_URL", "SECRET_KEY", "DJANGO_SECRET_KEY", "ROOT_URLCONF"}
+        ):
+            env.pop(key, None)
     env["PIPELINE_LOCAL"] = "1"
-    env.setdefault("DATABASE_ENGINE", "sqlite3")
-    env.setdefault("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
+    env["DATABASE_ENGINE"] = "sqlite3"
+    env["DJANGO_ALLOWED_HOSTS"] = "localhost,127.0.0.1"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [root for root in roots if root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+    )
+    return env
 
-    manage_path = None
+
+def _generated_project_reference_violations(project_dir):
+    """Find host-application references only inside the generated workspace."""
+    violations = []
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
+        for filename in files:
+            path = os.path.join(root, filename)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    for line_number, line in enumerate(handle, 1):
+                        if HOST_DJANGO_PACKAGE in line:
+                            relative = os.path.relpath(path, project_dir).replace(os.sep, "/")
+                            violations.append(
+                                f"{relative}:{line_number} references host package {HOST_DJANGO_PACKAGE}"
+                            )
+                            break
+            except OSError:
+                continue
+    return violations
+
+
+def _discover_generated_django(project_dir):
+    """Discover and validate a generated Django project without importing host modules."""
+    candidates = []
     for root, dirs, files in os.walk(project_dir):
         dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
         if "manage.py" in files:
-            manage_path = os.path.join(root, "manage.py")
-            break
+            candidates.append(os.path.join(root, "manage.py"))
+    if not candidates:
+        return {"manage_path": None, "errors": ["Generated Django manage.py is missing"]}
 
+    manage_path = sorted(candidates)[0]
+    backend_dir = os.path.dirname(manage_path)
+    try:
+        with open(manage_path, "r", encoding="utf-8", errors="replace") as handle:
+            manage_source = handle.read()
+    except OSError as error:
+        return {"manage_path": manage_path, "errors": [f"Cannot read manage.py: {error}"]}
+
+    match = re.search(
+        r"DJANGO_SETTINGS_MODULE\s*['\"]?\s*\]\s*=\s*['\"]([^'\"]+)['\"]",
+        manage_source,
+    )
+    if not match:
+        match = re.search(
+            r"DJANGO_SETTINGS_MODULE['\"]?\s*,\s*['\"]([^'\"]+)['\"]",
+            manage_source,
+        )
+    settings_module = match.group(1).strip() if match else None
+    errors = []
+    if not settings_module:
+        errors.append("manage.py does not define DJANGO_SETTINGS_MODULE")
+    elif settings_module == HOST_DJANGO_PACKAGE or settings_module.startswith(f"{HOST_DJANGO_PACKAGE}."):
+        errors.append(f"manage.py points to host settings module {settings_module}")
+
+    settings_path = None
+    package_root = None
+    if settings_module and re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", settings_module):
+        parts = settings_module.split(".")
+        for root in (backend_dir, project_dir):
+            candidate = os.path.join(root, *parts[:-1], f"{parts[-1]}.py")
+            if os.path.isfile(candidate):
+                settings_path = candidate
+                package_root = root
+                break
+    if not settings_path:
+        errors.append(f"Generated settings module {settings_module or '(missing)'} cannot be resolved inside the workspace")
+    else:
+        package_path = os.path.dirname(settings_path)
+        if not os.path.isfile(os.path.join(package_path, "__init__.py")):
+            errors.append(f"Generated Django package is missing __init__.py: {package_path}")
+        for required in ("urls.py", "wsgi.py", "asgi.py"):
+            if not os.path.isfile(os.path.join(package_path, required)):
+                errors.append(f"Generated Django package is missing {required}")
+
+    return {
+        "manage_path": manage_path,
+        "backend_dir": backend_dir,
+        "settings_module": settings_module,
+        "settings_path": settings_path,
+        "package_root": package_root,
+        "errors": errors,
+    }
+
+
+def _validate_project_locally(project_dir):
+    """Run the generated app's own backend and frontend build gates."""
+    checks = []
+    project_files = []
+    if os.path.isdir(project_dir):
+        for root, dirs, files in os.walk(project_dir):
+            dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
+            project_files.extend(os.path.join(root, name) for name in files)
+    checks.append({
+        "name": "Project structure",
+        "passed": bool(project_files),
+        "output": "Generated workspace is present" if project_files else "Generated workspace is empty or missing",
+    })
+    host_references = _generated_project_reference_violations(project_dir)
+    checks.append({
+        "name": "Generated-project isolation",
+        "passed": not host_references,
+        "output": "\n".join(host_references) or "No Buildify host application references found",
+    })
+
+    django_project = _discover_generated_django(project_dir)
+    manage_path = django_project.get("manage_path")
     if manage_path:
         try:
             python = _project_python(project_dir)
-            backend_dir = os.path.dirname(manage_path)
-            python_paths = [backend_dir, project_dir]
-            env["PYTHONPATH"] = os.pathsep.join(
-                python_paths + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
-            )
+            backend_dir = django_project["backend_dir"]
+            package_root = django_project.get("package_root") or backend_dir
+            env = _generated_environment(project_dir, [backend_dir, package_root])
+            if django_project.get("settings_module"):
+                env["DJANGO_SETTINGS_MODULE"] = django_project["settings_module"]
+            dependency_paths = [
+                os.path.join(backend_dir, "requirements.txt"),
+                os.path.join(project_dir, "requirements.txt"),
+            ]
+            for requirements in dependency_paths:
+                if os.path.isfile(requirements):
+                    install = subprocess.run(
+                        [python, "-m", "pip", "install", "-r", requirements, "-q"],
+                        cwd=os.path.dirname(requirements), env=env,
+                        capture_output=True, text=True, timeout=300,
+                    )
+                    if install.returncode != 0:
+                        checks.append({
+                            "name": "Backend dependency installation",
+                            "passed": False,
+                            "output": (install.stdout + install.stderr).strip(),
+                        })
+            for error in django_project.get("errors", []):
+                checks.append({"name": "Generated Django project discovery", "passed": False, "output": error})
             python_files = []
             for root, dirs, files in os.walk(backend_dir):
                 dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
@@ -1781,26 +1920,61 @@ def _validate_project_locally(project_dir):
                 cwd=backend_dir, env=env, capture_output=True, text=True, timeout=180,
             )
             checks.append({"name": "Python compilation", "passed": compile_result.returncode == 0, "output": (compile_result.stdout + compile_result.stderr).strip()})
-            for name, command in (
-                ("Django system check", [python, manage_path, "check"]),
-                ("Django migrations", [python, manage_path, "migrate", "--noinput"]),
-                ("Django migration check", [python, manage_path, "makemigrations", "--check", "--dry-run"]),
-            ):
-                result = subprocess.run(
-                    command, cwd=backend_dir, env=env, capture_output=True,
+            if not django_project.get("errors"):
+                settings_import = subprocess.run(
+                    [python, "-c", f"import {django_project['settings_module']}"],
+                    cwd=backend_dir, env=env, capture_output=True,
                     text=True, timeout=180,
                 )
-                checks.append({"name": name, "passed": result.returncode == 0, "output": (result.stdout + result.stderr).strip()})
+                checks.append({
+                    "name": "Generated settings import",
+                    "passed": settings_import.returncode == 0,
+                    "output": (settings_import.stdout + settings_import.stderr).strip(),
+                })
+                for name, command in (
+                    ("Django settings import and system check", [python, manage_path, "check"]),
+                    ("Django migrations", [python, manage_path, "migrate", "--noinput"]),
+                    ("Django migration check", [python, manage_path, "makemigrations", "--check", "--dry-run"]),
+                ):
+                    result = subprocess.run(
+                        command, cwd=backend_dir, env=env, capture_output=True,
+                        text=True, timeout=180,
+                    )
+                    checks.append({"name": name, "passed": result.returncode == 0, "output": (result.stdout + result.stderr).strip()})
         except Exception as error:
             checks.append({"name": "Django validation", "passed": False, "output": str(error)})
+    else:
+        checks.extend({"name": "Generated Django project discovery", "passed": False, "output": error} for error in django_project.get("errors", []))
 
     package_paths = []
+    frontend_directories = []
     for root, dirs, files in os.walk(project_dir):
         dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
+        if os.path.basename(root).lower() in {"frontend", "react_frontend", "web"}:
+            frontend_directories.append(root)
         if "package.json" in files:
             package_paths.append(os.path.join(root, "package.json"))
 
+    frontend_required = any(
+        os.path.basename(path).lower() in {"frontend", "react_frontend", "web"}
+        for path in frontend_directories
+    ) or any(
+        "react" in (open(path, encoding="utf-8", errors="replace").read(4000).lower())
+        for path in package_paths
+    )
+    if frontend_required and not package_paths:
+        checks.append({"name": "Frontend package.json", "passed": False, "output": "React frontend detected or required, but package.json is missing"})
+
+    if manage_path:
+        dependency_paths = [
+            os.path.join(os.path.dirname(manage_path), "requirements.txt"),
+            os.path.join(project_dir, "requirements.txt"),
+        ]
+        if not any(os.path.isfile(path) for path in dependency_paths):
+            checks.append({"name": "Backend dependency file", "passed": False, "output": "Django manage.py found but no requirements.txt exists in the generated backend or root"})
+
     npm = "npm.cmd" if os.name == "nt" else "npm"
+    env = _generated_environment(project_dir, [project_dir])
     for package_path in package_paths:
         package_dir = os.path.dirname(package_path)
         try:
@@ -1815,6 +1989,19 @@ def _validate_project_locally(project_dir):
                 checks.append({"name": "Frontend dependency install", "passed": False, "output": (install.stdout + install.stderr).strip()})
                 continue
             package = json.loads(open(package_path, encoding="utf-8").read())
+            if "react" in json.dumps(package).lower():
+                frontend_dir = os.path.dirname(package_path)
+                source_dir = os.path.join(frontend_dir, "src")
+                entrypoints = {
+                    "index.js", "index.jsx", "index.ts", "index.tsx",
+                    "main.js", "main.jsx", "main.ts", "main.tsx",
+                }
+                source_files = set(os.listdir(source_dir)) if os.path.isdir(source_dir) else set()
+                checks.append({
+                    "name": "Frontend structure",
+                    "passed": bool(source_files & entrypoints),
+                    "output": "React source entrypoint found" if source_files & entrypoints else "React package has no src entrypoint",
+                })
             if "build" not in package.get("scripts", {}):
                 checks.append({"name": "Frontend build", "passed": True, "output": "No build script declared"})
                 continue
@@ -1828,31 +2015,184 @@ def _validate_project_locally(project_dir):
     return {"passed": all(check["passed"] for check in checks), "checks": checks}
 
 
-def _find_generated_settings_module(project_dir, backend_dir):
-    """Find generated Django settings without inheriting host Django settings."""
-    config_files = [
-        os.path.join(project_dir, "pytest.ini"),
-        os.path.join(backend_dir, "pytest.ini"),
-    ]
-    for config_path in config_files:
-        if not os.path.isfile(config_path):
+def _acceptance_findings(acceptance):
+    """Convert every failed acceptance check into actionable repair findings."""
+    findings = []
+    severity_by_check = {
+        "Generated-project isolation": "critical",
+        "Generated settings import": "critical",
+        "Django settings import and system check": "critical",
+        "Django system check": "critical",
+        "Django migrations": "major",
+        "Django migration check": "major",
+        "Generated Django project discovery": "critical",
+        "Project entrypoint": "critical",
+        "Backend dependency file": "major",
+        "Frontend package.json": "major",
+        "Frontend structure": "major",
+    }
+    repair_by_check = {
+        "Generated-project isolation": "Remove host-application imports and configuration from the generated workspace.",
+        "Generated Django project discovery": "Create an independent generated package and point manage.py to its settings module.",
+        "Generated settings import": "Repair the generated settings package and its dependencies without importing Buildify modules.",
+        "Django settings import and system check": "Fix the generated Django settings, installed apps, URLs, and dependencies.",
+        "Django migrations": "Add or repair generated app migrations and database configuration.",
+        "Django migration check": "Create consistent migrations for the generated applications.",
+        "Backend dependency file": "Add a complete generated backend requirements.txt.",
+        "Frontend package.json": "Add the generated React frontend package.json and scripts.",
+        "Frontend structure": "Restore the generated frontend entrypoint and source structure.",
+    }
+    for check in acceptance.get("checks", []):
+        if check.get("passed"):
             continue
-        with open(config_path, "r", encoding="utf-8", errors="replace") as config_file:
-            match = re.search(r"^\s*DJANGO_SETTINGS_MODULE\s*=\s*([^\s#]+)", config_file.read(), re.MULTILINE)
-        if match:
-            return match.group(1).strip()
+        output = check.get("output", "")
+        affected = None
+        path_match = re.search(r"(?:[A-Za-z]:)?[^\s:]+\.(?:py|js|jsx|ts|tsx|json)", output)
+        module_match = re.search(r"No module named ['\"]?([^'\"\s]+)", output)
+        if path_match:
+            affected = path_match.group(0)
+        elif module_match:
+            affected = module_match.group(1)
+        findings.append({
+            "check_name": check.get("name", "Unknown acceptance check"),
+            "failure_type": "process_failure" if "timed out" in output.lower() else "validation_failure",
+            "exact_error": output,
+            "affected_path_or_module": affected,
+            "severity": severity_by_check.get(check.get("name"), "major"),
+            "recommended_repair": repair_by_check.get(
+                check.get("name"),
+                "Repair the generated workspace for this check and rerun all acceptance checks.",
+            ),
+        })
+    return findings
 
-    search_roots = [backend_dir, project_dir] if os.path.isdir(backend_dir) else [project_dir]
-    for root in search_roots:
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in {"node_modules", ".git", "__pycache__"}]
-            if "settings.py" not in filenames:
-                continue
-            relative = os.path.relpath(os.path.join(dirpath, "settings.py"), root)
-            parts = os.path.splitext(relative)[0].replace(os.sep, ".").split(".")
-            if parts[-1] == "settings":
-                return ".".join(parts)
-    return None
+
+FINALIZATION_REPAIR_ATTEMPTS = 3
+
+
+def _run_finalization(pipeline, project, all_tasks, project_files, project_dir, selected_model):
+    """Run complete acceptance and bounded targeted repairs on the current workspace."""
+    if pipeline.finalization_state == PipelineRun.FinalizationState.ACCEPTED:
+        pipeline.append_log("[Finalization] Already accepted; preserving generated workspace")
+        return True
+
+    pipeline.finalization_state = PipelineRun.FinalizationState.RUNNING
+    pipeline.finalization_attempts = 0
+    pipeline.finalization_error = ""
+    pipeline.save(update_fields=["finalization_state", "finalization_attempts", "finalization_error"])
+
+    retry_context = {
+        "original_task": {
+            "title": "Project finalization",
+            "description": project.description or "Validate and finalize the generated project",
+        },
+        "acceptance_contract": {
+            "reviewer_acceptance_criteria": [
+                "Every final acceptance check passes in the isolated generated workspace.",
+                "No generated file references the Buildify host application.",
+            ],
+            "prohibited_approaches": [
+                f"Do not import or reference {HOST_DJANGO_PACKAGE}.",
+                "Do not repair failures by modifying the Buildify host application.",
+            ],
+        },
+        "test_failures": [],
+        "debugger_analysis": [],
+        "reviewer_findings": [],
+        "unresolved_issues": [],
+        "attempt": 0,
+    }
+
+    for attempt in range(1, FINALIZATION_REPAIR_ATTEMPTS + 1):
+        pipeline.finalization_attempts = attempt
+        pipeline.stage = PipelineRun.Stage.DEBUGGING
+        pipeline.save(update_fields=["stage", "finalization_attempts"])
+        pipeline.append_log(
+            f"[Finalization] Attempt {attempt}/{FINALIZATION_REPAIR_ATTEMPTS}: "
+            "running all acceptance checks"
+        )
+        try:
+            acceptance = _validate_project_locally(project_dir)
+        except Exception as error:
+            acceptance = {
+                "passed": False,
+                "checks": [{
+                    "name": "Final acceptance execution",
+                    "passed": False,
+                    "output": f"{type(error).__name__}: {error}",
+                }],
+            }
+        for check in acceptance["checks"]:
+            pipeline.append_log(
+                f"[Acceptance] {check['name']}: {'PASSED' if check['passed'] else 'FAILED'}"
+            )
+            if not check["passed"]:
+                pipeline.append_log(f"[Acceptance] {check['output'][-2000:]}")
+
+        if acceptance["passed"]:
+            pipeline.finalization_state = PipelineRun.FinalizationState.ACCEPTED
+            pipeline.finalization_error = ""
+            pipeline.save(update_fields=["finalization_state", "finalization_error", "stage"])
+            pipeline.append_log("[Finalization] All acceptance checks passed")
+            return True
+
+        findings = _acceptance_findings(acceptance)
+        retry_context["attempt"] = attempt
+        retry_context["reviewer_findings"] = findings
+        retry_context["unresolved_issues"] = findings
+        retry_context["test_failures"] = [finding["exact_error"] for finding in findings]
+        pipeline.append_log(f"[Finalization] {len(findings)} structured failure finding(s)")
+        for finding in findings:
+            pipeline.append_log(
+                f"  [{finding['severity'].upper()}] {finding['check_name']}: "
+                f"{finding['recommended_repair']}"
+            )
+
+        if attempt == FINALIZATION_REPAIR_ATTEMPTS:
+            pipeline.finalization_state = PipelineRun.FinalizationState.FAILED
+            pipeline.finalization_error = json.dumps(findings, indent=2)
+            pipeline.stage = PipelineRun.Stage.FAILED
+            pipeline.error = "Finalization failed after bounded repair attempts"
+            pipeline.save(update_fields=[
+                "finalization_state", "finalization_error", "stage", "error",
+            ])
+            pipeline.append_log("[Finalization] Repair limit reached; workspace remains resumable")
+            pipeline.append_log("[FinalizationContext] " + _retry_context_text(retry_context))
+            return False
+
+        diagnostics = [
+            f"{finding['check_name']}: {finding['exact_error']}"
+            for finding in findings
+        ]
+        try:
+            repaired = _repair_workspace(
+                all_tasks[-1] if all_tasks else SimpleNamespace(
+                    title="Project finalization", description=project.description or ""
+                ),
+                project,
+                project_files,
+                project_dir,
+                pipeline,
+                diagnostics,
+                selected_model,
+                acceptance_contract=retry_context["acceptance_contract"],
+                retry_context=retry_context,
+            )
+        except Exception as error:
+            repaired = False
+            retry_context["debugger_analysis"] = [f"{type(error).__name__}: {error}"]
+            pipeline.append_log(f"[Finalization] Repair error: {error}")
+        pipeline.append_log(
+            f"[Finalization] Targeted repair {'applied' if repaired else 'not applied'}; "
+            "the next attempt will rerun every check"
+        )
+
+    return False
+
+
+def _find_generated_settings_module(project_dir, backend_dir):
+    """Compatibility wrapper for the single isolation-safe Django discovery path."""
+    return _discover_generated_django(project_dir).get("settings_module")
 
 
 def _generate_project_readme(project, project_files, project_dir, model_name=None):

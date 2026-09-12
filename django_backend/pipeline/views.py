@@ -24,15 +24,22 @@ class PipelineRunViewSet(viewsets.ReadOnlyModelViewSet):
             project_id=pipeline.project_id,
             status__in=["todo", "in_progress"],
         ).exists()
-        if pipeline.stage != PipelineRun.Stage.FAILED and not (
-            pipeline.stage == PipelineRun.Stage.COMPLETED and has_unfinished_tasks
-        ):
+        can_resume_finalization = pipeline.finalization_state in {
+            PipelineRun.FinalizationState.PENDING,
+            PipelineRun.FinalizationState.FAILED,
+        } and not has_unfinished_tasks
+        if pipeline.finalization_state == PipelineRun.FinalizationState.ACCEPTED:
+            return Response(
+                {"error": "Project is already accepted"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if pipeline.stage != PipelineRun.Stage.FAILED and not can_resume_finalization:
             return Response(
                 {"error": "Pipeline is already running or completed"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         from .service import run_pipeline
-        run_pipeline(pipeline.project_id)
+        run_pipeline(pipeline.project_id, pipeline_id=pipeline.id)
         return Response({"status": "restarted"})
 
     @action(detail=True, methods=["post"])

@@ -284,8 +284,39 @@ const App = () => {
   const [config, setConfig] = useState(loadConfig);
   const [panelOpen, setPanelOpen] = useState(false);
 
-  const applyConfig = useCallback((cfg) => {
+  const applyConfig = useCallback((cfg, activeTheme) => {
     const root = document.documentElement;
+
+    if (activeTheme !== "glass") {
+      [
+        "--icon-tint",
+        "--icon-tint-light",
+        "--icon-tint-mid",
+        "--icon-tint-glow",
+        "--icon-tint-hue",
+        "--app-font",
+        "--bg-primary",
+        "--text-primary",
+        "--text-secondary",
+        "--text-muted",
+        "--border",
+        "--bg-card",
+        "--bg-hover",
+        "--bg-input",
+        "--glass",
+        "--glass-border",
+      ].forEach((property) => root.style.removeProperty(property));
+      [
+        "data-glass-mode",
+        "data-glass-icons",
+        "data-wallpaper",
+        "data-background-effects",
+        "data-3d-effects",
+        "data-font",
+      ].forEach((attribute) => root.removeAttribute(attribute));
+      return;
+    }
+
     const tint = TINT_COLORS.find((t) => t.name === cfg.tint) || TINT_COLORS[0];
 
     root.style.setProperty("--icon-tint", tint.color);
@@ -384,6 +415,14 @@ const App = () => {
   useEffect(() => {
     const wp = document.querySelector(".bg-wallpaper");
     if (!wp) return;
+    if (theme !== "glass") {
+      wp.style.background = "";
+      wp.style.backgroundSize = "";
+      wp.style.backgroundPosition = "";
+      wp.style.animation = "";
+      wp.style.opacity = "";
+      return;
+    }
     if (config.wallpaper === "custom" && config.customWallpaper) {
       wp.style.background = `url(${config.customWallpaper})`;
       wp.style.backgroundSize = "cover";
@@ -403,7 +442,7 @@ const App = () => {
       wp.style.animation = "";
       wp.style.opacity = "0";
     }
-  }, [config.wallpaper, config.customWallpaper]);
+  }, [theme, config.wallpaper, config.customWallpaper]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -411,14 +450,14 @@ const App = () => {
   }, [theme]);
 
   useEffect(() => {
-    applyConfig(config);
+    applyConfig(config, theme);
     try {
       localStorage.setItem("glassConfig", JSON.stringify(config));
     } catch (e) {
       const fallback = { ...config, customWallpaper: null, customBgColor: null };
       try { localStorage.setItem("glassConfig", JSON.stringify(fallback)); } catch {}
     }
-  }, [config, applyConfig]);
+  }, [config, theme, applyConfig]);
 
   useEffect(() => {
     if (theme !== "glass") return;

@@ -14,6 +14,12 @@ class PipelineRun(models.Model):
         COMPLETED = "completed", "Completed"
         FAILED = "failed", "Failed"
 
+    class FinalizationState(models.TextChoices):
+        PENDING = "pending", "Finalization pending"
+        RUNNING = "running", "Finalization running"
+        FAILED = "failed", "Finalization failed"
+        ACCEPTED = "accepted", "Project accepted"
+
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="pipeline_runs")
     stage = models.CharField(max_length=20, choices=Stage.choices, default=Stage.PLANNING)
     current_task = models.CharField(max_length=255, blank=True, default="")
@@ -21,6 +27,13 @@ class PipelineRun(models.Model):
     completed_tasks = models.IntegerField(default=0)
     log = models.TextField(blank=True, default="")
     error = models.TextField(blank=True, default="")
+    finalization_state = models.CharField(
+        max_length=20,
+        choices=FinalizationState.choices,
+        default=FinalizationState.PENDING,
+    )
+    finalization_attempts = models.PositiveSmallIntegerField(default=0)
+    finalization_error = models.TextField(blank=True, default="")
     stream_token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
