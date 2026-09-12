@@ -54,4 +54,6 @@ RUN python manage.py collectstatic --noinput
 # ---------------------------------------------------------
 
 EXPOSE 8000
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:$PORT --access-logfile - --error-logfile - student_project_manager.wsgi:application"]
+RUN python manage.py collectstatic --noinput
+
+CMD ["sh", "-c", "python manage.py migrate --noinput && gunicorn student_project_manager.wsgi:application --bind 0.0.0.0:$PORT"]
