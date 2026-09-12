@@ -4,7 +4,9 @@ import ast
 import json
 import re
 import threading
+import signal
 from typing import Iterable, Optional
+from contextlib import contextmanager
 
 from django.conf import settings
 
@@ -18,6 +20,9 @@ API_KEY = settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
 MODEL_NAME = settings.GEMINI_MODEL_NAME
 FALLBACK_MODEL_NAMES = os.getenv("GEMINI_FALLBACK_MODELS", "")
 
+# API timeout for Gemini calls (must be less than gunicorn's 30-second worker timeout)
+GEMINI_TIMEOUT_SECONDS = 20
+
 _client = None
 _model_context = threading.local()
 LEGACY_MODEL_ALIASES = {
@@ -27,6 +32,11 @@ LEGACY_MODEL_ALIASES = {
     "moonshotai/kimi-k2-instruct": "openai/gpt-oss-120b",
     "meta-llama/llama-4-maverick-17b-128e-instruct": "openai/gpt-oss-120b",
 }
+
+
+class TimeoutError(Exception):
+    """Raised when an operation exceeds its timeout."""
+    pass
 
 
 class GeminiAPIError(Exception):
@@ -43,6 +53,32 @@ def _gemini_error(error: Exception) -> GeminiAPIError:
         provider_status = provider_status.value
     message = str(error).strip() or error.__class__.__name__
     return GeminiAPIError(message, provider_status)
+
+
+@contextmanager
+def _timeout_guard(seconds: int):
+    """Context manager that enforces a timeout using threading."""
+    result = {"timed_out": False}
+    
+    def timeout_handler():
+        result["timed_out"] = True
+    
+    # Use signal.alarm on Unix-like systems
+    if hasattr(signal, "alarm"):
+        def alarm_handler(signum, frame):
+            raise TimeoutError(f"Operation timed out after {seconds} seconds")
+        
+        old_handler = signal.signal(signal.SIGALRM, alarm_handler)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+    else:
+        # On Windows or if signal.alarm is not available, just yield without timeout
+        # This is not ideal but prevents breaking on Windows
+        yield
 
 
 def get_client():
@@ -118,10 +154,17 @@ def _generate_content(contents):
     failures = []
     for index, model in enumerate(models):
         try:
-            response = client.models.generate_content(model=model, contents=contents)
+            with _timeout_guard(GEMINI_TIMEOUT_SECONDS):
+                response = client.models.generate_content(model=model, contents=contents)
             if not response.text:
                 raise GeminiAPIError(f"Gemini model '{model}' returned an empty response.")
             return response.text
+        except TimeoutError as error:
+            # Timeout occurred; treat as a retriable failure
+            api_error = GeminiAPIError(str(error), 504)
+            failures.append(f"{model}: timeout")
+            if index == len(models) - 1:
+                raise api_error from error
         except Exception as error:
             api_error = _gemini_error(error)
             failures.append(f"{model}: {api_error}")
@@ -152,8 +195,8 @@ def generate_response(prompt: str, model_name: Optional[str] = None) -> str:
                 completion = OpenAI(
                     base_url=base_url,
                     api_key=api_key,
-                    timeout=180.0,
-                    max_retries=2,
+                    timeout=GEMINI_TIMEOUT_SECONDS,
+                    max_retries=1,
                 ).chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": prompt}],
@@ -161,9 +204,12 @@ def generate_response(prompt: str, model_name: Optional[str] = None) -> str:
                     max_tokens=8192,
                 )
                 return completion.choices[0].message.content
-            response = get_client().models.generate_content(model=model_name, contents=prompt)
+            with _timeout_guard(GEMINI_TIMEOUT_SECONDS):
+                response = get_client().models.generate_content(model=model_name, contents=prompt)
             return response.text
         return _generate_content(prompt)
+    except TimeoutError as error:
+        raise GeminiAPIError(f"API request timed out: {error}", 504) from error
     except Exception as error:
         raise _gemini_error(error) from error
 
