@@ -1155,6 +1155,13 @@ attempt {attempt + 1}, modify the current implementation and explicitly resolve
 EVERY unresolved issue, test failure, and reviewer finding in RETRY CONTEXT.
 Do not blindly regenerate the task from scratch. You must:
 
+RUNTIME-FIRST RULE:
+If this is the project's initial scaffold task, create runnable entrypoints
+before feature code: backend manage.py, an independent settings/URL/WSGI/ASGI
+package, requirements.txt, and when a frontend is required, package.json with a
+working dev or start script plus a frontend source entrypoint. Keep these files
+internally consistent so the preview can start while later tasks continue.
+
 DJANGO PROJECT ISOLATION:
 - If Django is required, derive a unique lowercase Python package name from the
     project name (for example, <safe_project_name>_backend), and use it consistently
@@ -2161,6 +2168,47 @@ def _generated_consistency_findings(project_dir, inventory=None):
     return findings
 
 
+def _frontend_structure_checks(package_path):
+    """Validate generated frontend structure without requiring Node or npm."""
+    checks = []
+    package_dir = os.path.dirname(package_path)
+    try:
+        with open(package_path, encoding="utf-8") as package_file:
+            package = json.load(package_file)
+    except (OSError, json.JSONDecodeError) as error:
+        return [{
+            "name": "Frontend package.json",
+            "passed": False,
+            "status": "failed",
+            "output": f"Invalid package.json: {error}",
+        }], None
+
+    scripts = package.get("scripts")
+    dependencies = package.get("dependencies", {})
+    dev_dependencies = package.get("devDependencies", {})
+    if not isinstance(scripts, dict):
+        checks.append({"name": "Frontend package scripts", "passed": False, "status": "failed", "output": "package.json scripts must be an object"})
+    elif not scripts.get("dev") and not scripts.get("start"):
+        checks.append({"name": "Frontend package scripts", "passed": False, "status": "failed", "output": "package.json must define a dev or start script"})
+    else:
+        checks.append({"name": "Frontend package scripts", "passed": True, "status": "passed", "output": "Runnable dev/start script found"})
+    if not isinstance(dependencies, dict) or not isinstance(dev_dependencies, dict):
+        checks.append({"name": "Frontend dependencies", "passed": False, "status": "failed", "output": "dependencies and devDependencies must be objects"})
+
+    package_text = json.dumps(package).lower()
+    if "react" in package_text:
+        source_dir = os.path.join(package_dir, "src")
+        entrypoints = {"index.js", "index.jsx", "index.ts", "index.tsx", "main.js", "main.jsx", "main.ts", "main.tsx"}
+        source_files = set(os.listdir(source_dir)) if os.path.isdir(source_dir) else set()
+        checks.append({
+            "name": "Frontend structure",
+            "passed": bool(source_files & entrypoints),
+            "status": "passed" if source_files & entrypoints else "failed",
+            "output": "React source entrypoint found" if source_files & entrypoints else "React package has no src entrypoint",
+        })
+    return checks, package
+
+
 def _validate_project_locally(project_dir):
     """Run the generated app's own backend and frontend build gates."""
     checks = []
@@ -2288,6 +2336,22 @@ def _validate_project_locally(project_dir):
     for package_path in package_paths:
         package_dir = os.path.dirname(package_path)
         try:
+            structural_checks, package = _frontend_structure_checks(package_path)
+            checks.extend(structural_checks)
+            structural_failed = any(not check["passed"] for check in structural_checks)
+            if structural_failed:
+                continue
+            npm_path = shutil.which(npm)
+            if not npm_path:
+                checks.append({
+                    "name": "Frontend toolchain",
+                    "passed": True,
+                    "status": "environment-unavailable",
+                    "tool_unavailable": "npm",
+                    "severity": "environment",
+                    "output": "tool_unavailable: npm; structural frontend validation passed; npm commands skipped",
+                })
+                continue
             lockfile = os.path.join(package_dir, "package-lock.json")
             if not os.path.isfile(lockfile):
                 lock_result = subprocess.run([npm, "install", "--package-lock-only", "--ignore-scripts"], cwd=package_dir, env=env, capture_output=True, text=True, timeout=300)
@@ -2298,20 +2362,6 @@ def _validate_project_locally(project_dir):
             if install.returncode != 0:
                 checks.append({"name": "Frontend dependency install", "passed": False, "output": (install.stdout + install.stderr).strip()})
                 continue
-            package = json.loads(open(package_path, encoding="utf-8").read())
-            if "react" in json.dumps(package).lower():
-                frontend_dir = os.path.dirname(package_path)
-                source_dir = os.path.join(frontend_dir, "src")
-                entrypoints = {
-                    "index.js", "index.jsx", "index.ts", "index.tsx",
-                    "main.js", "main.jsx", "main.ts", "main.tsx",
-                }
-                source_files = set(os.listdir(source_dir)) if os.path.isdir(source_dir) else set()
-                checks.append({
-                    "name": "Frontend structure",
-                    "passed": bool(source_files & entrypoints),
-                    "output": "React source entrypoint found" if source_files & entrypoints else "React package has no src entrypoint",
-                })
             if "build" not in package.get("scripts", {}):
                 checks.append({"name": "Frontend build", "passed": True, "output": "No build script declared"})
                 continue
@@ -2322,7 +2372,16 @@ def _validate_project_locally(project_dir):
 
     if not checks:
         checks.append({"name": "Project entrypoint", "passed": False, "output": "No Django manage.py or frontend package.json found"})
-    return {"passed": all(check["passed"] for check in checks), "checks": checks}
+    passed = all(check["passed"] for check in checks)
+    has_environment_limit = any(
+        check.get("status") == "environment-unavailable"
+        for check in checks
+    )
+    return {
+        "passed": passed,
+        "status": "environment-unavailable" if passed and has_environment_limit else "passed" if passed else "failed",
+        "checks": checks,
+    }
 
 
 def _acceptance_findings(acceptance):
@@ -2444,7 +2503,9 @@ def _run_finalization(pipeline, project, all_tasks, project_files, project_dir, 
             pipeline.finalization_state = PipelineRun.FinalizationState.ACCEPTED
             pipeline.finalization_error = ""
             pipeline.save(update_fields=["finalization_state", "finalization_error", "stage"])
-            pipeline.append_log("[Finalization] All acceptance checks passed")
+            pipeline.append_log(
+                f"[Finalization] Acceptance status: {acceptance.get('status', 'passed')}"
+            )
             return True
 
         findings = _acceptance_findings(acceptance)

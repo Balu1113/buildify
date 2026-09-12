@@ -218,10 +218,13 @@ const ProjectList = () => {
   const [modifyPrompt, setModifyPrompt] = useState("");
   const [modifyLoading, setModifyLoading] = useState(false);
   const [modifyHistory, setModifyHistory] = useState([]);
+  const [applyChatChanges, setApplyChatChanges] = useState(false);
   const logRef = useRef(null);
   const pollRef = useRef(null);
   const runPollRef = useRef(null);
   const modifyEndRef = useRef(null);
+  const autoRunProjectRef = useRef(null);
+  const previewSignatureRef = useRef(null);
 
   useEffect(() => { fetchProjects(); return () => { if (pollRef.current) clearInterval(pollRef.current); if (runPollRef.current) clearInterval(runPollRef.current); }; }, []);
 
@@ -229,22 +232,46 @@ const ProjectList = () => {
   const fetchProjects = async () => { try { const r = await projectAPI.list(); setProjects(r.data); } catch {} };
   const fetchTasks = async (pid) => { try { const r = await taskAPI.list({ project_id: pid }); setTasks(r.data); } catch {} };
   const fetchPipeline = async (pid) => { try { const r = await pipelineAPI.getByProject(pid); if (r.data?.length) { setPipeline(r.data[0]); return r.data[0]; } } catch {} return null; };
-  const fetchFiles = async (pid) => { try { const r = await generatedAPI.files(`project_${pid}`); setFiles(r.data.files || []); } catch { setFiles([]); } };
+  const fetchFiles = async (pid) => { try { const r = await generatedAPI.files(`project_${pid}`); const nextFiles = r.data.files || []; setFiles(nextFiles); return nextFiles; } catch { setFiles([]); return []; } };
 
   const startPolling = (pid) => {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
-      const p = await fetchPipeline(pid); await fetchTasks(pid); await fetchFiles(pid);
+      const p = await fetchPipeline(pid); await fetchTasks(pid); const currentFiles = await fetchFiles(pid);
       if (p && (p.stage === "completed" || p.stage === "failed")) {
         clearInterval(pollRef.current); pollRef.current = null; setLoading(false);
-        if (p.stage === "completed") { showToast("Build complete! Your project is ready.", "success"); await fetchFiles(pid); }
+        if (p.stage === "completed") {
+          showToast("Build complete. Starting project preview...", "success");
+          const completedKey = `${pid}:completed`;
+          if (autoRunProjectRef.current !== completedKey) {
+            previewSignatureRef.current = null;
+            const started = await handleRunForProject(pid, true);
+            if (started) {
+              autoRunProjectRef.current = completedKey;
+              previewSignatureRef.current = currentFiles.map((file) => `${file.path}:${file.updated_at || file.size}`).join("|");
+            }
+          }
+        }
         else showToast("Build stopped. Review the unfinished tasks and retry.", "error");
+      } else if (p && currentFiles.length) {
+        const activeKey = `${pid}:active`;
+        const signature = currentFiles.map((file) => `${file.path}:${file.updated_at || file.size}`).join("|");
+        if (autoRunProjectRef.current !== activeKey || previewSignatureRef.current !== signature) {
+          const restarted = await handleRunForProject(pid, true);
+          if (restarted) {
+            autoRunProjectRef.current = activeKey;
+            previewSignatureRef.current = signature;
+            showToast("Live preview updated from the latest generated files.", "info");
+          }
+        }
       }
     }, 3000);
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault(); setLoading(true); setToast(null); setFiles([]); setSelectedFile(null); setRunInfo(null);
+    autoRunProjectRef.current = null;
+    previewSignatureRef.current = null;
     try {
       const r = await projectAPI.create(formData); setSelectedProject(r.data.id); setSelectedAiModel(formData.ai_model); setFormData({ name: "", description: "", ai_model: formData.ai_model });
       showToast("Project created. AI agents are building...", "info"); fetchProjects(); await fetchTasks(r.data.id);
@@ -279,6 +306,8 @@ const ProjectList = () => {
 
   const handleSelect = async (p) => {
     setSelectedProject(p.id); setSelectedAiModel(p.ai_model || "deepseek/deepseek-chat-v3.1"); setSelectedFile(null); setFileContent(""); setRunInfo(null); setFileTab("view"); setModifyHistory([]);
+    autoRunProjectRef.current = null;
+    previewSignatureRef.current = null;
     setRunState({ status: "idle", port: null });
     if (runPollRef.current) { clearInterval(runPollRef.current); runPollRef.current = null; }
     await fetchTasks(p.id); const pi = await fetchPipeline(p.id); setPipeline(pi);
@@ -318,9 +347,11 @@ const ProjectList = () => {
     setModifyPrompt(""); setModifyLoading(true);
     setModifyHistory((h) => [...h, { role: "user", text: prompt }]);
     try {
-      const r = await generatedAPI.modify(`project_${selectedProject}`, prompt);
-      const summary = r.data.summary;
-      const changed = r.data.changed_files.join(", ");
+      const r = await generatedAPI.chat(`project_${selectedProject}`, prompt, modifyHistory, applyChatChanges);
+      const data = r.data;
+      const recommendations = (data.recommendations || []).map((item) => `${item.priority.toUpperCase()}: ${item.title} (${item.effort})`).join("\n");
+      const changed = (data.changed_files || []).join(", ");
+      const summary = [data.answer, data.project_assessment, recommendations ? `Recommendations:\n${recommendations}` : "", changed ? `Applied: ${changed}` : ""].filter(Boolean).join("\n\n");
       setModifyHistory((h) => [...h, { role: "ai", text: summary, files: changed }]);
       setFiles(r.data.files);
       if (selectedFile) {
@@ -329,7 +360,7 @@ const ProjectList = () => {
           setFileContent(fr.data.content); setEditorContent(fr.data.content);
         } catch {}
       }
-      showToast(`Modified: ${changed}`, "success");
+      showToast(changed ? `Applied: ${changed}` : "Advice received", "success");
     } catch (err) {
       const data = err.response?.data;
       const message = data?.detail || data?.error || "Modification failed. Try again.";
@@ -339,25 +370,28 @@ const ProjectList = () => {
     setModifyLoading(false);
   };
 
-  const handleRun = async () => {
+  const handleRunForProject = async (projectId, automatic = false) => {
     try {
       setRunState({ status: "starting", port: null });
-      const r = await generatedAPI.run(`project_${selectedProject}`);
+      const r = await generatedAPI.run(`project_${projectId}`);
       setTerminalInfo(r.data.terminal || null);
       if (r.data.status === "running") {
         setRunState({ status: "running", port: r.data.port });
-        showToast(`App running on port ${r.data.port}`, "success");
+        if (!automatic) showToast(`App running on port ${r.data.port}`, "success");
         startRunPolling();
-      } else {
-        setRunState({ status: "idle", port: null });
+        return true;
       }
     } catch (err) {
       setRunState({ status: "idle", port: null });
       const data = err.response?.data;
       setTerminalInfo(data?.terminal || null);
-      const msg = data?.output || data?.error || "Failed to start app";
-      showToast(msg, "error");
+      if (!automatic) showToast(data?.output || data?.error || "Failed to start app", "error");
     }
+    return false;
+  };
+
+  const handleRun = async () => {
+    await handleRunForProject(selectedProject);
   };
 
   const handleStop = async () => {
@@ -570,7 +604,8 @@ const ProjectList = () => {
                                 <div ref={modifyEndRef} />
                               </div>
                               <div style={{ display: "flex", gap: 8, padding: 12, borderTop: "1px solid var(--border)" }}>
-                                <input className="input" style={{ flex: 1 }} placeholder="Describe your modification..." value={modifyPrompt} onChange={(e) => setModifyPrompt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleModify(); } }} disabled={modifyLoading} />
+                                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-muted)" }}><input type="checkbox" checked={applyChatChanges} onChange={(e) => setApplyChatChanges(e.target.checked)} /> Apply changes</label>
+                                <input className="input" style={{ flex: 1 }} placeholder="Ask for features, fixes, or competitor-inspired improvements..." value={modifyPrompt} onChange={(e) => setModifyPrompt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleModify(); } }} disabled={modifyLoading} />
                                 <button onClick={handleModify} className="btn btn-primary btn-sm" disabled={modifyLoading || !modifyPrompt.trim()} style={{ padding: "6px 16px" }}>{modifyLoading ? <div className="spinner" style={{ width: 14, height: 14 }} /> : "Send"}</button>
                               </div>
                             </div>
@@ -624,7 +659,8 @@ const ProjectList = () => {
                   </div>
                 )}
                 <div style={{ display: "flex", gap: 8 }}>
-                  <input className="input" style={{ flex: 1 }} placeholder="Describe what you want to change..." value={modifyPrompt} onChange={(e) => setModifyPrompt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleModify(); } }} disabled={modifyLoading} />
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--text-muted)" }}><input type="checkbox" checked={applyChatChanges} onChange={(e) => setApplyChatChanges(e.target.checked)} /> Apply changes</label>
+                  <input className="input" style={{ flex: 1 }} placeholder="Ask for features, fixes, or competitor-inspired improvements..." value={modifyPrompt} onChange={(e) => setModifyPrompt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleModify(); } }} disabled={modifyLoading} />
                   <button onClick={handleModify} className="btn btn-primary" disabled={modifyLoading || !modifyPrompt.trim()} style={{ padding: "8px 20px" }}>{modifyLoading ? <div className="spinner" style={{ width: 14, height: 14 }} /> : "🚀 Send"}</button>
                 </div>
               </div>

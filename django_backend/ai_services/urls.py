@@ -10,6 +10,7 @@ urlpatterns = [
     path("generated/<str:project_id>/files/", generated_views.project_files, name="generated-files"),
     path("generated/<str:project_id>/file/", generated_views.read_file, name="generated-file"),
     path("generated/<str:project_id>/modify/", generated_views.modify_project, name="generated-modify"),
+    path("generated/<str:project_id>/chat/", generated_views.project_chat, name="generated-chat"),
     path("generated/<str:project_id>/save/", generated_views.save_file, name="generated-save"),
     path("generated/<str:project_id>/run/", generated_views.run_project, name="generated-run"),
     path("generated/<str:project_id>/stop/", generated_views.stop_project, name="generated-stop"),

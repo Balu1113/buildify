@@ -13,7 +13,7 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from . import gemini_ai
-from projects.models import Project
+from projects.models import GeneratedFile, Project
 from projects.storage import (
     delete_generated_file,
     load_project_files,
@@ -359,7 +359,7 @@ def list_projects(request):
             "id": f"project_{project.pk}",
             "name": project.name,
             "path": os.path.join(PROJECTS_DIR, f"project_{project.pk}"),
-            "files": [{"path": path, "size": len(content.encode("utf-8"))} for path, content in files.items()],
+            "files": _serialized_project_files(project),
             "file_count": len(files),
         })
 
@@ -374,7 +374,7 @@ def project_files(request, project_id):
             {"error": "Project not found"}, status=status.HTTP_404_NOT_FOUND
         )
 
-    files = [{"path": path, "size": len(content.encode("utf-8"))} for path, content in load_project_files(project).items()]
+    files = _serialized_project_files(project)
     return Response({"project_id": project_id, "files": files})
 
 
@@ -583,6 +583,60 @@ def modify_project(request, project_id):
     })
 
 
+@api_view(["POST"])
+def project_chat(request, project_id):
+    """Chat about a persisted generated project, with optional explicit application of changes."""
+    project, _ = _project_workspace(project_id)
+    if project is None:
+        return Response({"error": "Project not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    message = str(request.data.get("message", "")).strip()
+    if not message:
+        return Response({"error": "message is required"}, status=status.HTTP_400_BAD_REQUEST)
+    conversation = request.data.get("conversation", [])
+    if not isinstance(conversation, list):
+        return Response({"error": "conversation must be a list"}, status=status.HTTP_400_BAD_REQUEST)
+    apply_changes = bool(request.data.get("apply_changes", False))
+
+    try:
+        result = gemini_ai.project_chat(
+            load_project_files(project),
+            message,
+            conversation=conversation[-20:],
+            apply_changes=apply_changes,
+        )
+    except gemini_ai.GeminiAPIError as error:
+        return Response({"error": str(error), "detail": str(error)}, status=error.status_code)
+    if not result:
+        return Response({"error": "Project chat failed"}, status=status.HTTP_502_BAD_GATEWAY)
+
+    changed_files = []
+    if apply_changes:
+        for filename, content in (result.get("files") or {}).items():
+            try:
+                save_generated_file(project, filename, content)
+            except ValueError as error:
+                return Response({"error": str(error)}, status=status.HTTP_400_BAD_REQUEST)
+            changed_files.append(filename)
+        for filename, content in (result.get("new_files") or {}).items():
+            try:
+                save_generated_file(project, filename, content)
+            except ValueError as error:
+                return Response({"error": str(error)}, status=status.HTTP_400_BAD_REQUEST)
+            changed_files.append(filename)
+        for filename in result.get("deleted_files") or []:
+            try:
+                delete_generated_file(project, filename)
+            except ValueError as error:
+                return Response({"error": str(error)}, status=status.HTTP_400_BAD_REQUEST)
+            changed_files.append(f"deleted:{filename}")
+
+    result["changed_files"] = changed_files
+    result["files"] = _serialized_project_files(project)
+    result["changes_applied"] = bool(apply_changes and changed_files)
+    return Response(result)
+
+
 @api_view(["PUT"])
 def save_file(request, project_id):
     project, project_dir = _project_workspace(project_id)
@@ -606,8 +660,14 @@ def save_file(request, project_id):
 
 def _serialized_project_files(project):
     return [
-        {"path": path, "size": len(content.encode("utf-8"))}
-        for path, content in load_project_files(project).items()
+        {
+            "path": item.path,
+            "size": len(item.content.encode("utf-8")),
+            "updated_at": item.updated_at.isoformat(),
+        }
+        for item in GeneratedFile.objects.filter(project=project).only(
+            "path", "content", "updated_at"
+        )
     ]
 
 

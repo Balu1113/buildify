@@ -232,7 +232,6 @@ def extract_python_symbols(source_code: str) -> dict:
                         })
     return symbols
 
-
 def validate_python_syntax(source_code: str) -> tuple:
     """Validate Python syntax. Returns (is_valid, error_message)."""
     try:
@@ -428,7 +427,10 @@ Return ONLY valid JSON:
 }}
 
 Rules:
-- First task should set up project structure (manage.py, settings, requirements.txt, etc.)
+- First task must create a runnable project scaffold before feature work: backend
+    manage.py, settings, urls, wsgi/asgi, requirements, and, when a frontend is
+    required, frontend package.json with a working dev/start script and source entrypoint.
+    The scaffold must be startable independently before later feature tasks build on it.
 - Each subsequent task should add specific functionality
 - Last tasks should handle testing, polish, and documentation
 - Be specific about what files and code each task produces
@@ -460,13 +462,14 @@ def review_code(source_files: dict, test_results: str = "") -> Optional[dict]:
         f"=== {filename} ===\n{content}" for filename, content in source_files.items()
     )
 
+    test_results_section = f"Test results:\n{test_results}" if test_results else ""
     prompt = f"""You are a senior software engineer performing a thorough code review.
 
 Review the following source files for a student project:
 
 {files_text}
 
-{"Test results:\n" + test_results if test_results else ""}
+{test_results_section}
 
 Evaluate:
 1. Correctness - Does the code work as intended?
@@ -549,3 +552,71 @@ Rules:
         raise GeminiAPIError(f"AI returned invalid JSON: {error.msg}", 502) from error
     except Exception as e:
         raise GeminiAPIError(f"AI modification response could not be processed: {e}", 502) from e
+
+
+def project_chat(source_files: dict, message: str, conversation=None, apply_changes=False) -> Optional[dict]:
+    """Advise on a generated project and optionally return an explicit change set."""
+    files_text = "\n\n".join(
+        f"=== {filename} ===\n{content[:12000]}" for filename, content in source_files.items()
+    )
+    history_text = json.dumps(conversation or [], ensure_ascii=True)[-12000:]
+    prompt = f"""You are a senior product engineer, UX strategist, and software architect.
+
+You are advising on an existing generated project. Inspect its actual files before
+making claims. The user asks:
+{message}
+
+Conversation so far:
+{history_text}
+
+Current project files:
+{files_text}
+
+Provide useful, concrete product advice. When asked to compare competitors, do not
+invent private facts or claim live market data. Compare against recognizable market
+patterns and common capabilities of relevant products, label assumptions, and focus
+on differentiated opportunities the project can realistically build.
+
+Return ONLY valid JSON:
+{{
+  "answer": "Clear direct response to the user",
+  "project_assessment": "What the current project already does and where it is weak",
+  "competitor_patterns": [
+    {{"pattern": "Capability common in comparable products", "user_value": "Why it matters", "assumption": "What is assumed"}}
+  ],
+  "recommendations": [
+    {{"title": "Feature or improvement", "priority": "high|medium|low", "impact": "Expected user or business impact", "effort": "small|medium|large", "reason": "Why it fits this project"}}
+  ],
+  "next_steps": ["Ordered implementation steps"],
+  "change_plan": ["Files/components that would need changes"],
+  "files": {{}},
+  "new_files": {{}},
+  "deleted_files": [],
+  "changes_applied": {str(bool(apply_changes)).lower()}
+}}
+
+Rules:
+- Do not claim a change was applied unless apply_changes is true and files are returned.
+- If apply_changes is false, return an empty change set and recommendations only.
+- If apply_changes is true, return complete file contents only for files that need changes.
+- Preserve existing APIs, authentication, project isolation, and persistence.
+- Never reference or import the Buildify host application.
+- Do not include markdown outside the JSON."""
+    try:
+        response_text = generate_response(prompt).strip()
+        clean_json = re.sub(r"```json\s*|\s*```", "", response_text).strip()
+        result = json.loads(clean_json)
+        if not isinstance(result, dict):
+            raise ValueError("AI chat response was not an object")
+        if not apply_changes:
+            result["files"] = {}
+            result["new_files"] = {}
+            result["deleted_files"] = []
+            result["changes_applied"] = False
+        return result
+    except GeminiAPIError:
+        raise
+    except json.JSONDecodeError as error:
+        raise GeminiAPIError(f"AI chat returned invalid JSON: {error.msg}", 502) from error
+    except Exception as error:
+        raise GeminiAPIError(f"AI chat response could not be processed: {error}", 502) from error
