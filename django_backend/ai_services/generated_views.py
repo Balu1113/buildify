@@ -175,16 +175,21 @@ def _get_run_command(project_dir, script, port=None):
         return command
     return [PYTHON, script]
 
-
+import shutil
 def _ensure_node_dependencies(project_dir, script):
     if not script.endswith("package.json"):
         return None
 
     package_dir = os.path.dirname(os.path.join(project_dir, script))
+
     if os.path.isdir(os.path.join(package_dir, "node_modules")):
         return None
 
-    npm_command = "npm.cmd" if os.name == "nt" else "npm"
+    npm_command = shutil.which("npm.cmd" if os.name == "nt" else "npm")
+
+    if npm_command is None:
+        return "tool_unavailable: npm"
+
     try:
         result = subprocess.run(
             [npm_command, "install"],
@@ -194,14 +199,21 @@ def _ensure_node_dependencies(project_dir, script):
             timeout=300,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired:
+        return "Unable to install JavaScript dependencies: npm install timed out"
+    except OSError as error:
         return f"Unable to install JavaScript dependencies: {error}"
 
     if result.returncode != 0:
-        details = (result.stderr or result.stdout or "npm install failed").strip()
-        return f"Unable to install JavaScript dependencies: {details[-1000:]}"
-    return None
+        details = (
+            result.stderr
+            or result.stdout
+            or "npm install failed"
+        ).strip()
 
+        return f"Unable to install JavaScript dependencies: {details[-1000:]}"
+
+    return None
 
 def _start_process(project_id, project_dir, script):
     if project_id in _running_processes:
@@ -210,51 +222,94 @@ def _start_process(project_id, project_dir, script):
     scripts = [script]
     frontend_script = script if script.endswith("package.json") else None
     backend_script = None
-    for candidate in ("manage.py", os.path.join("backend", "manage.py"), os.path.join("server", "manage.py")):
+
+    for candidate in (
+        "manage.py",
+        os.path.join("backend", "manage.py"),
+        os.path.join("server", "manage.py"),
+    ):
         if os.path.exists(os.path.join(project_dir, candidate)):
             backend_script = candidate
             break
+
     if frontend_script and backend_script:
         scripts = [backend_script, frontend_script]
 
     processes = []
     frontend_info = None
+
     try:
         for current_script in scripts:
-            file_port = _detect_port_from_files(project_dir) if current_script == backend_script else None
+            file_port = (
+                _detect_port_from_files(project_dir)
+                if current_script == backend_script
+                else None
+            )
             port = file_port or _find_free_port()
-            dependency_error = _ensure_node_dependencies(project_dir, current_script)
+
+            dependency_error = _ensure_node_dependencies(
+                project_dir,
+                current_script,
+            )
+
             if dependency_error:
+                # npm/node is unavailable in the execution environment.
+                if (
+                    isinstance(dependency_error, dict)
+                    and dependency_error.get("status") == "environment-unavailable"
+                ):
+                    for info in processes:
+                        info["proc"].terminate()
+
+                    return None, dependency_error
+
                 raise RuntimeError(dependency_error)
 
             cmd = _get_run_command(project_dir, current_script, port)
+
             env = os.environ.copy()
             env["PORT"] = str(port)
             env["FLASK_RUN_PORT"] = str(port)
             env["FLASK_APP"] = "app.py"
             env["PYTHONDONTWRITEBYTECODE"] = "1"
             env.pop("DJANGO_SETTINGS_MODULE", None)
+
             if current_script.endswith("manage.py"):
-                settings_module = _detect_settings_module(project_dir, current_script)
+                settings_module = _detect_settings_module(
+                    project_dir,
+                    current_script,
+                )
                 if settings_module:
                     env["DJANGO_SETTINGS_MODULE"] = settings_module
 
             cwd = project_dir
             script_dir = os.path.dirname(current_script)
+
             if current_script.endswith("package.json"):
-                cwd = os.path.dirname(os.path.join(project_dir, current_script))
+                cwd = os.path.dirname(
+                    os.path.join(project_dir, current_script)
+                )
+
             elif current_script.endswith(".py") and script_dir:
                 cwd = os.path.join(project_dir, script_dir)
                 cmd[1] = os.path.basename(current_script)
 
             python_paths = [cwd]
+
             for source_dir in ("backend", "src"):
                 source_path = os.path.join(project_dir, source_dir)
-                if os.path.isdir(source_path) and source_path not in python_paths:
+
+                if (
+                    os.path.isdir(source_path)
+                    and source_path not in python_paths
+                ):
                     python_paths.append(source_path)
+
             existing_python_path = env.get("PYTHONPATH")
+
             if existing_python_path:
                 python_paths.append(existing_python_path)
+
             env["PYTHONPATH"] = os.pathsep.join(python_paths)
 
             proc = subprocess.Popen(
@@ -265,16 +320,25 @@ def _start_process(project_id, project_dir, script):
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                creationflags=getattr(
+                    subprocess,
+                    "CREATE_NO_WINDOW",
+                    0,
+                ),
             )
+
             output_lines = []
 
             def reader(process=proc, lines=output_lines):
                 for line in iter(process.stdout.readline, ""):
                     lines.append(line)
 
-            thread = threading.Thread(target=reader, daemon=True)
+            thread = threading.Thread(
+                target=reader,
+                daemon=True,
+            )
             thread.start()
+
             info = {
                 "proc": proc,
                 "port": port,
@@ -284,22 +348,37 @@ def _start_process(project_id, project_dir, script):
                 "cwd": cwd,
                 "command_display": _format_command(cmd),
             }
+
             processes.append(info)
+
             if frontend_script and current_script == frontend_script:
                 frontend_info = info
+
     except Exception as error:
         for info in processes:
             info["proc"].terminate()
+
         return None, str(error)
 
     _running_processes[project_id] = {
         "processes": processes,
-        "port": frontend_info["port"] if frontend_info else processes[0]["port"],
-        "pid": frontend_info["proc"].pid if frontend_info else processes[0]["proc"].pid,
+        "port": (
+            frontend_info["port"]
+            if frontend_info
+            else processes[0]["port"]
+        ),
+        "pid": (
+            frontend_info["proc"].pid
+            if frontend_info
+            else processes[0]["proc"].pid
+        ),
         "started_at": time.time(),
     }
-    return {"port": _running_processes[project_id]["port"], "pid": _running_processes[project_id]["pid"]}, None
 
+    return {
+        "port": _running_processes[project_id]["port"],
+        "pid": _running_processes[project_id]["pid"],
+    }, None
 
 def _detect_settings_module(project_dir, manage_script):
     """Read the generated manage.py setting without importing Buildify settings."""
@@ -437,8 +516,22 @@ def run_project(request, project_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    result, error = _start_process(project_id, project_dir, run_script)
+    result, error = _start_process(
+        project_id,
+        project_dir,
+        run_script,
+    )
+
     if error:
+        if (
+            isinstance(error, dict)
+            and error.get("status") == "environment-unavailable"
+        ):
+            return Response(
+                error,
+                status=status.HTTP_200_OK,
+            )
+
         return Response(
             {"error": f"Failed to start process: {error}"},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
