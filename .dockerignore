@@ -1,0 +1,63 @@
+# Git
+.git
+.gitignore
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv
+venv
+env
+ai_files/.venv
+**/.venv
+**/venv
+**/env
+
+# Python cache
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Testing / type checking
+.pytest_cache
+**/.pytest_cache
+.mypy_cache
+**/.mypy_cache
+.coverage
+htmlcov
+
+# Node
+node_modules
+**/node_modules
+
+# React build
+react_frontend/build
+react_frontend/dist
+
+# Generated projects
+generated_projects
+
+# Logs
+*.log
+logs
+**/logs
+
+# IDE/editor
+.vscode
+.idea
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+
+# Documentation / unnecessary files
+*.md
