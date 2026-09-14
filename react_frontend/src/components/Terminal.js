@@ -53,11 +53,26 @@ const Terminal = ({ terminalInfo, preparationStatus }) => {
 
             {/* Prep info */}
             <div style={{ padding: 12, background: "var(--bg-primary)", borderBottom: "1px solid var(--border)" }}>
-              <div style={{ fontSize: 11, color: "var(--text-secondary)" }}>
+              <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 8 }}>
                 {preparationStatus.message}
               </div>
-              {preparationStatus.stage && (
-                <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 6 }}>
+              {preparationStatus.stage === "npm_install" && (
+                <>
+                  {preparationStatus.package_dir && (
+                    <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 6 }}>
+                      <strong>CWD:</strong> {preparationStatus.package_dir}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 11, fontFamily: "monospace", color: "var(--accent)", wordBreak: "break-all", whiteSpace: "pre-wrap", marginBottom: 6 }}>
+                    $ {preparationStatus.command || "npm install --no-audit --no-fund"}
+                  </div>
+                  <div style={{ fontSize: 10, color: "var(--text-muted)" }}>
+                    Stage: <code style={{ color: "var(--accent)" }}>{preparationStatus.stage}</code>
+                  </div>
+                </>
+              )}
+              {preparationStatus.stage && preparationStatus.stage !== "npm_install" && (
+                <div style={{ fontSize: 10, color: "var(--text-muted)" }}>
                   Stage: <code style={{ color: "var(--accent)" }}>{preparationStatus.stage}</code>
                 </div>
               )}

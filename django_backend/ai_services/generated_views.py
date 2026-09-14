@@ -253,6 +253,8 @@ def _prepare_frontend(project_id, project_dir, script):
                 "error": None,
                 "stage": "npm_install",
                 "message": "Installing React frontend dependencies.",
+                "package_dir": package_dir,
+                "command": f"{npm_command} install --no-audit --no-fund",
             }
 
         print(
@@ -289,6 +291,8 @@ def _prepare_frontend(project_id, project_dir, script):
                     "stage": "npm_install",
                     "error": details[-4000:],
                     "message": "Failed to install React frontend dependencies.",
+                    "package_dir": package_dir,
+                    "command": f"{npm_command} install --no-audit --no-fund",
                 }
             return
 
@@ -304,6 +308,8 @@ def _prepare_frontend(project_id, project_dir, script):
                 "error": None,
                 "stage": "dependencies_installed",
                 "message": "React frontend dependencies are ready.",
+                "package_dir": package_dir,
+                "command": f"{npm_command} install --no-audit --no-fund",
             }
 
     except subprocess.TimeoutExpired:
@@ -314,6 +320,8 @@ def _prepare_frontend(project_id, project_dir, script):
                 "stage": "npm_install",
                 "error": "npm install timed out after 300 seconds",
                 "message": "Frontend dependency installation timed out.",
+                "package_dir": package_dir,
+                "command": f"{npm_command} install --no-audit --no-fund",
             }
 
     except Exception as error:
@@ -330,6 +338,8 @@ def _prepare_frontend(project_id, project_dir, script):
                 "stage": "npm_install",
                 "error": str(error),
                 "message": "Frontend preparation failed.",
+                "package_dir": package_dir if 'package_dir' in locals() else None,
+                "command": f"{npm_command} install --no-audit --no-fund" if 'npm_command' in locals() else None,
             }
 
 
