@@ -235,6 +235,7 @@ def _ensure_node_dependencies(project_dir, script):
 
 def _prepare_frontend(project_id, project_dir, script):
     """Install frontend dependencies in a background thread."""
+
     try:
         package_dir = _ensure_node_dependencies(project_dir, script)
 
@@ -248,8 +249,16 @@ def _prepare_frontend(project_id, project_dir, script):
         with _preview_jobs_lock:
             _preview_jobs[project_id] = {
                 "status": "preparing",
+                "severity": "in-progress",
+                "error": None,
                 "stage": "npm_install",
+                "message": "Installing React frontend dependencies.",
             }
+
+        print(
+            f"[Buildify] Starting npm install for project {project_id}",
+            flush=True,
+        )
 
         result = subprocess.run(
             [npm_command, "install", "--no-audit", "--no-fund"],
@@ -267,34 +276,60 @@ def _prepare_frontend(project_id, project_dir, script):
                 or "npm install failed"
             ).strip()
 
+            print(
+                f"[Buildify] npm install failed for project {project_id}: "
+                f"{details[-4000:]}",
+                flush=True,
+            )
+
             with _preview_jobs_lock:
                 _preview_jobs[project_id] = {
                     "status": "failed",
+                    "severity": "error",
                     "stage": "npm_install",
                     "error": details[-4000:],
+                    "message": "Failed to install React frontend dependencies.",
                 }
             return
+
+        print(
+            f"[Buildify] npm install completed for project {project_id}",
+            flush=True,
+        )
 
         with _preview_jobs_lock:
             _preview_jobs[project_id] = {
                 "status": "ready",
+                "severity": "ready",
+                "error": None,
                 "stage": "dependencies_installed",
+                "message": "React frontend dependencies are ready.",
             }
 
     except subprocess.TimeoutExpired:
         with _preview_jobs_lock:
             _preview_jobs[project_id] = {
                 "status": "failed",
+                "severity": "error",
                 "stage": "npm_install",
                 "error": "npm install timed out after 300 seconds",
+                "message": "Frontend dependency installation timed out.",
             }
 
     except Exception as error:
+        print(
+            f"[Buildify] Frontend preparation error for project "
+            f"{project_id}: {error}",
+            flush=True,
+        )
+
         with _preview_jobs_lock:
             _preview_jobs[project_id] = {
                 "status": "failed",
+                "severity": "error",
                 "stage": "npm_install",
                 "error": str(error),
+                "message": "Frontend preparation failed.",
             }
 
 
@@ -306,25 +341,33 @@ def _get_preview_job(project_id):
 
 def _start_frontend_preparation(project_id, project_dir, script):
     """Start frontend dependency installation without blocking the request."""
+
     existing = _get_preview_job(project_id)
 
     if existing and existing.get("status") in {"preparing", "ready"}:
         return existing
 
+    # Set preparing BEFORE starting the thread.
     with _preview_jobs_lock:
         _preview_jobs[project_id] = {
             "status": "preparing",
-            "stage": "queued",
+            "severity": "in-progress",
+            "error": None,
+            "stage": "npm_install",
+            "message": "Installing React frontend dependencies.",
         }
 
     thread = threading.Thread(
         target=_prepare_frontend,
         args=(project_id, project_dir, script),
         daemon=True,
+        name=f"frontend-prepare-{project_id}",
     )
+
     thread.start()
 
     return _get_preview_job(project_id)
+
 
 def _start_process(project_id, project_dir, script):
     if project_id in _running_processes:
