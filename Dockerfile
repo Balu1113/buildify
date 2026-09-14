@@ -66,4 +66,4 @@ RUN python manage.py collectstatic --noinput
 EXPOSE 8000
 RUN python manage.py collectstatic --noinput
 
-CMD ["sh", "-c", "python manage.py migrate --noinput && gunicorn student_project_manager.wsgi:application --bind 0.0.0.0:$PORT"]
+CMD ["sh", "-c", "node --version && npm --version && python manage.py migrate --noinput && gunicorn student_project_manager.wsgi:application --bind 0.0.0.0:$PORT"]
