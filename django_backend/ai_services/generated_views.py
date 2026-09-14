@@ -248,6 +248,21 @@ def _ensure_node_dependencies(project_dir, script):
 
     scripts = package.get("scripts", {})
 
+    print(
+        f"[Buildify] FRONTEND package.json: {package_path}",
+        flush=True,
+    )
+
+    print(
+        f"[Buildify] FRONTEND scripts: {scripts}",
+        flush=True,
+    )
+
+    print(
+        f"[Buildify] FRONTEND package name: {package.get('name')}",
+        flush=True,
+    )
+
     if "dev" not in scripts and "start" not in scripts:
         return {
             "status": "not-ready",
@@ -269,11 +284,23 @@ def _prepare_frontend(project_id, project_dir, script):
                 _preview_jobs[project_id] = package_dir
             return
 
-        node_modules_dir = os.path.join(package_dir, "node_modules")
+        npm_command = "npm.cmd" if os.name == "nt" else "npm"
 
-        if os.path.isdir(node_modules_dir):
+        node_modules_dir = os.path.join(
+            package_dir,
+            "node_modules",
+        )
+
+        vite_path = os.path.join(
+            node_modules_dir,
+            ".bin",
+            "vite",
+        )
+
+        # Dependencies are already installed correctly.
+        if os.path.exists(vite_path):
             print(
-                f"[Buildify] node_modules already exists for project {project_id}",
+                f"[Buildify] Vite already exists for project {project_id}",
                 flush=True,
             )
 
@@ -283,13 +310,13 @@ def _prepare_frontend(project_id, project_dir, script):
                     "severity": "ready",
                     "error": None,
                     "stage": "dependencies_installed",
-                    "message": "React frontend dependencies are already installed.",
+                    "message": "Frontend dependencies are ready.",
+                    "package_dir": package_dir,
                 }
 
             return
-        
-        npm_command = "npm.cmd" if os.name == "nt" else "npm"
 
+        # Dependencies are missing/incomplete, so install them.
         with _preview_jobs_lock:
             _preview_jobs[project_id] = {
                 "status": "preparing",
@@ -307,12 +334,21 @@ def _prepare_frontend(project_id, project_dir, script):
         )
 
         result = subprocess.run(
-            [npm_command, "install", "--no-audit", "--no-fund"],
+            [
+                npm_command,
+                "install",
+                "--no-audit",
+                "--no-fund",
+            ],
             cwd=package_dir,
             capture_output=True,
             text=True,
             timeout=300,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=getattr(
+                subprocess,
+                "CREATE_NO_WINDOW",
+                0,
+            ),
         )
 
         if result.returncode != 0:
@@ -323,8 +359,8 @@ def _prepare_frontend(project_id, project_dir, script):
             ).strip()
 
             print(
-                f"[Buildify] npm install failed for project {project_id}: "
-                f"{details[-4000:]}",
+                f"[Buildify] npm install failed for project "
+                f"{project_id}: {details[-4000:]}",
                 flush=True,
             )
 
@@ -334,12 +370,15 @@ def _prepare_frontend(project_id, project_dir, script):
                     "severity": "error",
                     "stage": "npm_install",
                     "error": details[-4000:],
-                    "message": "Failed to install React frontend dependencies.",
+                    "message": (
+                        "Failed to install React frontend dependencies."
+                    ),
                     "package_dir": package_dir,
-                    "command": f"{npm_command} install --no-audit --no-fund",
                 }
+
             return
 
+        # Verify that Vite was actually installed.
         vite_path = os.path.join(
             package_dir,
             "node_modules",
@@ -348,21 +387,36 @@ def _prepare_frontend(project_id, project_dir, script):
         )
 
         if not os.path.exists(vite_path):
+            details = (
+                result.stdout
+                or result.stderr
+                or ""
+            ).strip()
+
             with _preview_jobs_lock:
                 _preview_jobs[project_id] = {
                     "status": "failed",
                     "severity": "error",
                     "stage": "npm_install",
-                    "error": "vite executable was not found after npm install.",
-                    "message": "React dependencies were installed, but Vite is missing.",
+                    "error": (
+                        "Vite executable was not found after "
+                        "npm install."
+                    ),
+                    "message": (
+                        "React dependencies were installed, "
+                        "but Vite is missing."
+                    ),
+                    "npm_output": details[-4000:],
+                    "package_dir": package_dir,
                 }
+
             return
 
         print(
-            f"[Buildify] npm install completed for project {project_id}",
+            f"[Buildify] npm install completed for project "
+            f"{project_id}",
             flush=True,
         )
-
 
         with _preview_jobs_lock:
             _preview_jobs[project_id] = {
@@ -370,9 +424,8 @@ def _prepare_frontend(project_id, project_dir, script):
                 "severity": "ready",
                 "error": None,
                 "stage": "dependencies_installed",
-                "message": "React frontend dependencies are ready.",
+                "message": "Frontend dependencies are ready.",
                 "package_dir": package_dir,
-                "command": f"{npm_command} install --no-audit --no-fund",
             }
 
     except subprocess.TimeoutExpired:
@@ -382,9 +435,9 @@ def _prepare_frontend(project_id, project_dir, script):
                 "severity": "error",
                 "stage": "npm_install",
                 "error": "npm install timed out after 300 seconds",
-                "message": "Frontend dependency installation timed out.",
-                "package_dir": package_dir,
-                "command": f"{npm_command} install --no-audit --no-fund",
+                "message": (
+                    "Frontend dependency installation timed out."
+                ),
             }
 
     except Exception as error:
@@ -401,8 +454,6 @@ def _prepare_frontend(project_id, project_dir, script):
                 "stage": "npm_install",
                 "error": str(error),
                 "message": "Frontend preparation failed.",
-                "package_dir": package_dir if 'package_dir' in locals() else None,
-                "command": f"{npm_command} install --no-audit --no-fund" if 'npm_command' in locals() else None,
             }
 
 
