@@ -29,6 +29,9 @@ PROJECTS_DIR = settings.GENERATED_PROJECTS_DIR
 
 _running_processes = {}
 
+_preview_jobs = {}
+_preview_jobs_lock = threading.Lock()
+
 
 def _resolve_project(project_id):
     value = str(project_id)
@@ -134,7 +137,7 @@ def _get_run_command(project_dir, script, port=None):
                 )
             except Exception:
                 pass
-        return [PYTHON, script, "runserver", f"127.0.0.1:{port or 0}", "--noreload"]
+        return [PYTHON, script, "runserver", f"0.0.0.0:{port or 0}", "--noreload"]
     if script.endswith(".py"):
         req_dir = _get_requirements_dir(project_dir, script)
         if req_dir:
@@ -152,24 +155,11 @@ def _get_run_command(project_dir, script, port=None):
                 except Exception:
                     pass
         return [PYTHON, script]
+    
     if script.endswith("package.json"):
         package_dir = os.path.dirname(os.path.join(project_dir, script))
         package_path = os.path.join(package_dir, "package.json")
         
-        # Check for pre-built frontend (built during pipeline finalization)
-        for build_dir_name in ("dist", "build", "out"):
-            build_dir = os.path.join(package_dir, build_dir_name)
-            if os.path.isdir(build_dir):
-                # Serve pre-built app with a lightweight static server
-                # Use http.server for maximum compatibility (Python stdlib)
-                return [
-                    PYTHON,
-                    "-m",
-                    "http.server",
-                    str(port or 0),
-                    "--directory",
-                    build_dir,
-                ]
         
         try:
             with open(package_path, "r", encoding="utf-8") as package_file:
@@ -185,40 +175,156 @@ def _get_run_command(project_dir, script, port=None):
             )
 
         npm_command = "npm.cmd" if os.name == "nt" else "npm"
+
         command = [npm_command, "run", script_name]
+
         if port:
-            command.extend(["--", "--host", "127.0.0.1", "--port", str(port)])
+            command.extend(["--", "--host", "0.0.0.0", "--port", str(port)])
         return command
     return [PYTHON, script]
 
 import shutil
 def _ensure_node_dependencies(project_dir, script):
-    """
-    Check if a frontend project is ready to run.
-    
-    For preview, we only serve pre-built projects (dist/build/out).
-    npm install is expensive and blocks the worker; it should only run during pipeline finalization.
-    """
+    """Validate the frontend and return its package directory."""
     if not script.endswith("package.json"):
         return None
 
+    npm_command = "npm.cmd" if os.name == "nt" else "npm"
+
+    if shutil.which(npm_command) is None:
+        return {
+            "status": "environment-unavailable",
+            "severity": "user-action-required",
+            "error": "npm_unavailable",
+            "message": "Node.js/npm is not available in the Buildify execution environment.",
+        }
+
     package_dir = os.path.dirname(os.path.join(project_dir, script))
+    package_path = os.path.join(package_dir, "package.json")
 
-    # Check for pre-built frontend from pipeline finalization
-    for build_dir_name in ("dist", "build", "out"):
-        if os.path.isdir(os.path.join(package_dir, build_dir_name)):
-            # Pre-built frontend is available; no dependency installation needed
-            return None
+    if not os.path.exists(package_path):
+        return {
+            "status": "not-ready",
+            "severity": "user-action-required",
+            "error": "package_json_missing",
+            "message": "Frontend package.json was not found.",
+        }
 
-    # No pre-built files found. At preview time, we don't run npm install
-    # because it's too slow and blocks the worker. Instead, return a message
-    # telling the user to complete pipeline finalization.
-    return {
-        "status": "not-ready",
-        "severity": "user-action-required",
-        "error": "frontend_not_built",
-        "message": "Frontend not yet built. Complete the project pipeline finalization to generate the optimized build (dist/).",
-    }
+    try:
+        with open(package_path, "r", encoding="utf-8") as package_file:
+            package = json.load(package_file)
+    except (OSError, json.JSONDecodeError) as error:
+        return {
+            "status": "not-ready",
+            "severity": "user-action-required",
+            "error": "invalid_package_json",
+            "message": f"Unable to read package.json: {error}",
+        }
+
+    scripts = package.get("scripts", {})
+
+    if "dev" not in scripts and "start" not in scripts:
+        return {
+            "status": "not-ready",
+            "severity": "user-action-required",
+            "error": "frontend_script_missing",
+            "message": "Frontend package.json does not contain a dev or start script.",
+        }
+
+    return package_dir
+
+def _prepare_frontend(project_id, project_dir, script):
+    """Install frontend dependencies in a background thread."""
+    try:
+        package_dir = _ensure_node_dependencies(project_dir, script)
+
+        if isinstance(package_dir, dict):
+            with _preview_jobs_lock:
+                _preview_jobs[project_id] = package_dir
+            return
+
+        npm_command = "npm.cmd" if os.name == "nt" else "npm"
+
+        with _preview_jobs_lock:
+            _preview_jobs[project_id] = {
+                "status": "preparing",
+                "stage": "npm_install",
+            }
+
+        result = subprocess.run(
+            [npm_command, "install", "--no-audit", "--no-fund"],
+            cwd=package_dir,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        if result.returncode != 0:
+            details = (
+                result.stderr
+                or result.stdout
+                or "npm install failed"
+            ).strip()
+
+            with _preview_jobs_lock:
+                _preview_jobs[project_id] = {
+                    "status": "failed",
+                    "stage": "npm_install",
+                    "error": details[-4000:],
+                }
+            return
+
+        with _preview_jobs_lock:
+            _preview_jobs[project_id] = {
+                "status": "ready",
+                "stage": "dependencies_installed",
+            }
+
+    except subprocess.TimeoutExpired:
+        with _preview_jobs_lock:
+            _preview_jobs[project_id] = {
+                "status": "failed",
+                "stage": "npm_install",
+                "error": "npm install timed out after 300 seconds",
+            }
+
+    except Exception as error:
+        with _preview_jobs_lock:
+            _preview_jobs[project_id] = {
+                "status": "failed",
+                "stage": "npm_install",
+                "error": str(error),
+            }
+
+
+def _get_preview_job(project_id):
+    with _preview_jobs_lock:
+        job = _preview_jobs.get(project_id)
+
+    return dict(job) if job else None
+
+def _start_frontend_preparation(project_id, project_dir, script):
+    """Start frontend dependency installation without blocking the request."""
+    existing = _get_preview_job(project_id)
+
+    if existing and existing.get("status") in {"preparing", "ready"}:
+        return existing
+
+    with _preview_jobs_lock:
+        _preview_jobs[project_id] = {
+            "status": "preparing",
+            "stage": "queued",
+        }
+
+    thread = threading.Thread(
+        target=_prepare_frontend,
+        args=(project_id, project_dir, script),
+        daemon=True,
+    )
+    thread.start()
+
+    return _get_preview_job(project_id)
 
 def _start_process(project_id, project_dir, script):
     if project_id in _running_processes:
@@ -240,6 +346,34 @@ def _start_process(project_id, project_dir, script):
     if frontend_script and backend_script:
         scripts = [backend_script, frontend_script]
 
+    # ---------------------------------------------------------
+    # Frontend dependency preparation
+    # ---------------------------------------------------------
+    if frontend_script:
+        job = _get_preview_job(project_id)
+
+        if not job or job.get("status") not in {"ready"}:
+            if job and job.get("status") in {
+                "failed",
+                "environment-unavailable",
+                "not-ready",
+            }:
+                return None, job
+
+            job = _start_frontend_preparation(
+                project_id,
+                project_dir,
+                frontend_script,
+            )
+
+            return None, {
+                "status": "preparing",
+                "severity": "in-progress",
+                "error": None,
+                "stage": job.get("stage", "npm_install"),
+                "message": "Preparing the React frontend. npm dependencies are being installed.",
+            }
+
     processes = []
     frontend_info = None
 
@@ -250,30 +384,23 @@ def _start_process(project_id, project_dir, script):
                 if current_script == backend_script
                 else None
             )
+
             port = file_port or _find_free_port()
 
-            dependency_error = _ensure_node_dependencies(
+            cmd = _get_run_command(
                 project_dir,
                 current_script,
+                port,
             )
-
-            if dependency_error:
-                # Frontend is not built or npm is unavailable
-                if isinstance(dependency_error, dict):
-                    # Return structured error (environment-unavailable or not-ready)
-                    for info in processes:
-                        info["proc"].terminate()
-                    return None, dependency_error
-
-                raise RuntimeError(dependency_error)
-
-            cmd = _get_run_command(project_dir, current_script, port)
 
             env = os.environ.copy()
             env["PORT"] = str(port)
             env["FLASK_RUN_PORT"] = str(port)
             env["FLASK_APP"] = "app.py"
             env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+            # Never allow Buildify's Django settings to leak
+            # into the generated project.
             env.pop("DJANGO_SETTINGS_MODULE", None)
 
             if current_script.endswith("manage.py"):
@@ -281,6 +408,7 @@ def _start_process(project_id, project_dir, script):
                     project_dir,
                     current_script,
                 )
+
                 if settings_module:
                     env["DJANGO_SETTINGS_MODULE"] = settings_module
 
@@ -293,13 +421,20 @@ def _start_process(project_id, project_dir, script):
                 )
 
             elif current_script.endswith(".py") and script_dir:
-                cwd = os.path.join(project_dir, script_dir)
+                cwd = os.path.join(
+                    project_dir,
+                    script_dir,
+                )
+
                 cmd[1] = os.path.basename(current_script)
 
             python_paths = [cwd]
 
             for source_dir in ("backend", "src"):
-                source_path = os.path.join(project_dir, source_dir)
+                source_path = os.path.join(
+                    project_dir,
+                    source_dir,
+                )
 
                 if (
                     os.path.isdir(source_path)
@@ -312,7 +447,9 @@ def _start_process(project_id, project_dir, script):
             if existing_python_path:
                 python_paths.append(existing_python_path)
 
-            env["PYTHONPATH"] = os.pathsep.join(python_paths)
+            env["PYTHONPATH"] = os.pathsep.join(
+                python_paths
+            )
 
             proc = subprocess.Popen(
                 cmd,
@@ -332,13 +469,17 @@ def _start_process(project_id, project_dir, script):
             output_lines = []
 
             def reader(process=proc, lines=output_lines):
-                for line in iter(process.stdout.readline, ""):
+                for line in iter(
+                    process.stdout.readline,
+                    "",
+                ):
                     lines.append(line)
 
             thread = threading.Thread(
                 target=reader,
                 daemon=True,
             )
+
             thread.start()
 
             info = {
@@ -353,12 +494,18 @@ def _start_process(project_id, project_dir, script):
 
             processes.append(info)
 
-            if frontend_script and current_script == frontend_script:
+            if (
+                frontend_script
+                and current_script == frontend_script
+            ):
                 frontend_info = info
 
     except Exception as error:
         for info in processes:
-            info["proc"].terminate()
+            try:
+                info["proc"].terminate()
+            except Exception:
+                pass
 
         return None, str(error)
 
@@ -492,29 +639,49 @@ def read_file(request, project_id):
 
 @api_view(["POST"])
 def run_project(request, project_id):
-    project, project_dir = _project_workspace(project_id, materialize=True)
+    project, project_dir = _project_workspace(
+        project_id,
+        materialize=True,
+    )
+
     if project is None:
         return Response(
-            {"error": "Project not found"}, status=status.HTTP_404_NOT_FOUND
+            {"error": "Project not found"},
+            status=status.HTTP_404_NOT_FOUND,
         )
 
     if project_id in _running_processes:
         info = _running_processes[project_id]
-        if all(process_info["proc"].poll() is None for process_info in info["processes"]):
+
+        if all(
+            process_info["proc"].poll() is None
+            for process_info in info["processes"]
+        ):
             return Response({
                 "status": "running",
                 "port": info["port"],
                 "pid": info["pid"],
-                "pids": [process_info["proc"].pid for process_info in info["processes"]],
-                "message": f"Already running on port {info['port']}",
+                "pids": [
+                    process_info["proc"].pid
+                    for process_info in info["processes"]
+                ],
+                "message": (
+                    f"Already running on port {info['port']}"
+                ),
             })
-        else:
-            _running_processes.pop(project_id, None)
+
+        _running_processes.pop(project_id, None)
 
     run_script = _find_run_script(project_dir)
+
     if not run_script:
         return Response(
-            {"error": "No runnable script found (main.py, app.py, manage.py, or package.json)"},
+            {
+                "error": (
+                    "No runnable script found "
+                    "(main.py, app.py, manage.py, or package.json)"
+                )
+            },
             status=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -525,66 +692,116 @@ def run_project(request, project_id):
     )
 
     if error:
-        if (
-            isinstance(error, dict)
-            and error.get("status") in ("environment-unavailable", "not-ready")
-        ):
+        if isinstance(error, dict):
             return Response(
                 error,
-                status=status.HTTP_200_OK,
+                status=(
+                    status.HTTP_200_OK
+                    if error.get("status") in {
+                        "preparing",
+                        "not-ready",
+                        "environment-unavailable",
+                    }
+                    else status.HTTP_500_INTERNAL_SERVER_ERROR
+                ),
             )
 
         return Response(
-            {"error": f"Failed to start process: {error}"},
+            {
+                "error": (
+                    f"Failed to start process: {error}"
+                )
+            },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
     time.sleep(0.5)
 
     proc_info = _running_processes.get(project_id)
-    if proc_info:
-        for process_info in proc_info["processes"]:
-            process_info["thread"].join(timeout=3)
-        stopped = [process_info for process_info in proc_info["processes"] if process_info["proc"].poll() is not None]
-        if stopped:
-            process_info = stopped[0]
-            exit_code = process_info["proc"].poll()
-            output = "".join(process_info["output"][-30:])
-            _stop_process(project_id)
-            return Response(
-                {
-                    "error": f"Process exited with code {exit_code}",
-                    "output": output,
-                    "terminal": _terminal_agent_snapshot(
-                        project_id, project_dir, {"processes": [process_info]}
-                    ),
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
 
-        if not _wait_for_port(result["port"], proc_info["processes"][-1]["proc"]):
-            output = "\n".join(
-                "".join(process_info["output"][-30:])
-                for process_info in proc_info["processes"]
+    if not proc_info:
+        return Response(
+            {
+                "error": "Preview process information was lost"
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    for process_info in proc_info["processes"]:
+        process_info["thread"].join(timeout=0.2)
+
+    stopped = [
+        process_info
+        for process_info in proc_info["processes"]
+        if process_info["proc"].poll() is not None
+    ]
+
+    if stopped:
+        process_info = stopped[0]
+        exit_code = process_info["proc"].poll()
+        output = "".join(
+            process_info["output"][-30:]
+        )
+
+        _stop_process(project_id)
+
+        return Response(
+            {
+                "error": f"Process exited with code {exit_code}",
+                "output": output,
+                "terminal": _terminal_agent_snapshot(
+                    project_id,
+                    project_dir,
+                    {
+                        "processes": [process_info]
+                    },
+                ),
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    if not _wait_for_port(
+        result["port"],
+        proc_info["processes"][-1]["proc"],
+    ):
+        output = "\n".join(
+            "".join(
+                process_info["output"][-30:]
             )
-            _stop_process(project_id)
-            return Response(
-                {
-                    "error": f"Preview process started but port {result['port']} did not become reachable",
-                    "output": output[-4000:],
-                },
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
+            for process_info in proc_info["processes"]
+        )
+
+        _stop_process(project_id)
+
+        return Response(
+            {
+                "error": (
+                    "Preview process started but "
+                    f"port {result['port']} "
+                    "did not become reachable"
+                ),
+                "output": output[-4000:],
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
 
     return Response({
         "status": "running",
         "port": result["port"],
         "pid": result["pid"],
-        "pids": [process_info["proc"].pid for process_info in proc_info["processes"]],
-        "message": f"App running on port {result['port']}",
-        "terminal": _terminal_agent_snapshot(project_id, project_dir, proc_info),
+        "pids": [
+            process_info["proc"].pid
+            for process_info in proc_info["processes"]
+        ],
+        "message": (
+            f"App running on port {result['port']}"
+        ),
+        "terminal": _terminal_agent_snapshot(
+            project_id,
+            project_dir,
+            proc_info,
+        ),
     })
-
 
 @api_view(["POST"])
 def stop_project(request, project_id):
@@ -597,22 +814,61 @@ def stop_project(request, project_id):
 @api_view(["GET"])
 def run_status(request, project_id):
     if project_id not in _running_processes:
-        return Response({"status": "not_running"})
+        job = _get_preview_job(project_id)
+
+        if job:
+            if job.get("status") == "preparing":
+                return Response({
+                    "status": "preparing",
+                    "stage": job.get("stage"),
+                    "message": "Preparing the frontend...",
+                })
+
+            if job.get("status") == "ready":
+                return Response({
+                    "status": "ready",
+                    "stage": job.get("stage"),
+                    "message": "Frontend dependencies are ready.",
+                })
+
+            return Response(job)
+
+        return Response({
+            "status": "not_running"
+        })
 
     info = _running_processes[project_id]
-    stopped = [process_info for process_info in info["processes"] if process_info["proc"].poll() is not None]
+
+    stopped = [
+        process_info
+        for process_info in info["processes"]
+        if process_info["proc"].poll() is not None
+    ]
+
     if stopped:
         poll = stopped[0]["proc"].poll()
         _stop_process(project_id)
-        return Response({"status": "stopped", "exit_code": poll})
+
+        return Response({
+            "status": "stopped",
+            "exit_code": poll,
+        })
 
     return Response({
         "status": "running",
         "port": info["port"],
         "pid": info["pid"],
-        "pids": [process_info["proc"].pid for process_info in info["processes"]],
+        "pids": [
+            process_info["proc"].pid
+            for process_info in info["processes"]
+        ],
         "terminal": _terminal_agent_snapshot(
-            project_id, os.path.join(PROJECTS_DIR, project_id), info
+            project_id,
+            os.path.join(
+                PROJECTS_DIR,
+                f"project_{project_id}",
+            ),
+            info,
         ),
     })
 
