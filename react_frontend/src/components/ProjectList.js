@@ -213,6 +213,7 @@ const ProjectList = () => {
   const [fileContent, setFileContent] = useState("");
   const [runInfo, setRunInfo] = useState(null);
   const [terminalInfo, setTerminalInfo] = useState(null);
+  const [preparationStatus, setPreparationStatus] = useState(null);
   const [runState, setRunState] = useState({ status: "idle", port: null });
   const [editorContent, setEditorContent] = useState("");
   const [fileTab, setFileTab] = useState("view");
@@ -306,7 +307,7 @@ const ProjectList = () => {
   };
 
   const handleSelect = async (p) => {
-    setSelectedProject(p.id); setSelectedAiModel(p.ai_model || "deepseek/deepseek-chat-v3.1"); setSelectedFile(null); setFileContent(""); setRunInfo(null); setFileTab("view"); setModifyHistory([]);
+    setSelectedProject(p.id); setSelectedAiModel(p.ai_model || "deepseek/deepseek-chat-v3.1"); setSelectedFile(null); setFileContent(""); setRunInfo(null); setFileTab("view"); setModifyHistory([]); setTerminalInfo(null); setPreparationStatus(null);
     autoRunProjectRef.current = null;
     previewSignatureRef.current = null;
     setRunState({ status: "idle", port: null });
@@ -374,22 +375,36 @@ const ProjectList = () => {
   const handleRunForProject = async (projectId, automatic = false) => {
     try {
       setRunState({ status: "starting", port: null });
+      setPreparationStatus(null);
       const r = await generatedAPI.run(`project_${projectId}`);
       setTerminalInfo(r.data.terminal || null);
       if (r.data.status === "running") {
         setRunState({ status: "running", port: r.data.port });
+        setPreparationStatus(null);
         if (!automatic) showToast(`App running on port ${r.data.port}`, "success");
         startRunPolling();
         return true;
       }
+      if (r.data.status === "preparing") {
+        setRunState({ status: "starting", port: null });
+        setPreparationStatus(r.data);
+        if (!automatic) showToast(r.data.message || "Preparing frontend dependencies...", "info");
+        startRunPolling();
+        return false;
+      }
       if (r.data.status === "environment-unavailable") {
+        setRunState({ status: "idle", port: null });
+        setPreparationStatus(null);
         showToast("Preview unavailable: Node.js/npm is not installed on the server.", "info");
       }
       if (r.data.status === "not-ready") {
+        setRunState({ status: "idle", port: null });
+        setPreparationStatus(null);
         showToast(r.data.message || "Frontend not yet built. Complete pipeline finalization.", "info");
       }
     } catch (err) {
       setRunState({ status: "idle", port: null });
+      setPreparationStatus(null);
       const data = err.response?.data;
       setTerminalInfo(data?.terminal || null);
       if (!automatic) showToast(data?.output || data?.error || "Failed to start app", "error");
@@ -406,6 +421,7 @@ const ProjectList = () => {
       await generatedAPI.stop(`project_${selectedProject}`);
       setRunState({ status: "idle", port: null });
       setTerminalInfo(null);
+      setPreparationStatus(null);
       if (runPollRef.current) { clearInterval(runPollRef.current); runPollRef.current = null; }
       showToast("App stopped", "info");
     } catch {}
@@ -417,13 +433,23 @@ const ProjectList = () => {
       try {
         const r = await generatedAPI.status(`project_${selectedProject}`);
         if (r.data.terminal) setTerminalInfo(r.data.terminal);
-        if (r.data.status === "stopped" || r.data.status === "not_running") {
+        
+        // Handle preparation status
+        if (r.data.status === "preparing") {
+          setPreparationStatus(r.data);
+          setRunState({ status: "starting", port: null });
+        } else if (r.data.status === "running") {
+          setPreparationStatus(null);
+          setRunState({ status: "running", port: r.data.port });
+        } else if (r.data.status === "stopped" || r.data.status === "not_running") {
           setRunState({ status: "idle", port: null });
           setTerminalInfo(null);
+          setPreparationStatus(null);
           clearInterval(runPollRef.current); runPollRef.current = null;
         }
       } catch {
         setRunState({ status: "idle", port: null });
+        setPreparationStatus(null);
         clearInterval(runPollRef.current); runPollRef.current = null;
       }
     }, 5000);
@@ -551,22 +577,18 @@ const ProjectList = () => {
                     ) : null}
                   </div>
                 </div>
-                {runState.status === "running" && runState.port && (
+                {(runState.status === "running" || runState.status === "starting") && (
                   <>
-                    <Terminal terminalInfo={terminalInfo} />
-                    <div style={{ marginBottom: 16, borderRadius: 12, overflow: "hidden", border: "1px solid var(--border)" }}>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px", background: "var(--bg-tertiary)", borderBottom: "1px solid var(--border)" }}>
-                        <span style={{ fontSize: 11, color: "var(--text-muted)" }}>🌐 Preview — localhost:{runState.port}</span>
-                        <a href={`http://localhost:${runState.port}`} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--accent)", textDecoration: "none" }}>↗ Open in new tab</a>
-                      </div>
-                      <iframe src={`http://localhost:${runState.port}`} style={{ width: "100%", height: 400, border: "none", background: "#fff" }} title="App Preview" />
-                    </div>
+                    <Terminal terminalInfo={terminalInfo} preparationStatus={preparationStatus} />
                   </>
                 )}
-                {runState.status === "starting" && (
-                  <div style={{ marginBottom: 16, padding: 20, textAlign: "center", background: "var(--bg-tertiary)", borderRadius: 12, border: "1px solid var(--border)" }}>
-                    <div className="spinner" style={{ margin: "0 auto 8px" }} />
-                    <div style={{ fontSize: 12, color: "var(--text-muted)" }}>Booting up the app...</div>
+                {runState.status === "running" && runState.port && (
+                  <div style={{ marginBottom: 16, borderRadius: 12, overflow: "hidden", border: "1px solid var(--border)" }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px", background: "var(--bg-tertiary)", borderBottom: "1px solid var(--border)" }}>
+                      <span style={{ fontSize: 11, color: "var(--text-muted)" }}>🌐 Preview — localhost:{runState.port}</span>
+                      <a href={`http://localhost:${runState.port}`} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--accent)", textDecoration: "none" }}>↗ Open in new tab</a>
+                    </div>
+                    <iframe src={`http://localhost:${runState.port}`} style={{ width: "100%", height: 400, border: "none", background: "#fff" }} title="App Preview" />
                   </div>
                 )}
                 {files.length > 0 ? (
