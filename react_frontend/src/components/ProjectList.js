@@ -6,6 +6,7 @@ import { javascript } from "@codemirror/lang-javascript";
 import { html } from "@codemirror/lang-html";
 import { css } from "@codemirror/lang-css";
 import { oneDark } from "@codemirror/theme-one-dark";
+import Terminal from "./Terminal";
 
 const STAGES = ["planning", "developing", "testing", "debugging", "reviewing", "completed"];
 const STAGE_ICONS = { planning: "📋", developing: "🔨", testing: "🧪", debugging: "🐛", reviewing: "👁️", completed: "✨", failed: "❌" };
@@ -551,13 +552,16 @@ const ProjectList = () => {
                   </div>
                 </div>
                 {runState.status === "running" && runState.port && (
-                  <div style={{ marginBottom: 16, borderRadius: 12, overflow: "hidden", border: "1px solid var(--border)" }}>
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px", background: "var(--bg-tertiary)", borderBottom: "1px solid var(--border)" }}>
-                      <span style={{ fontSize: 11, color: "var(--text-muted)" }}>🌐 Preview — localhost:{runState.port}</span>
-                      <a href={`http://localhost:${runState.port}`} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--accent)", textDecoration: "none" }}>↗ Open in new tab</a>
+                  <>
+                    <Terminal terminalInfo={terminalInfo} />
+                    <div style={{ marginBottom: 16, borderRadius: 12, overflow: "hidden", border: "1px solid var(--border)" }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px", background: "var(--bg-tertiary)", borderBottom: "1px solid var(--border)" }}>
+                        <span style={{ fontSize: 11, color: "var(--text-muted)" }}>🌐 Preview — localhost:{runState.port}</span>
+                        <a href={`http://localhost:${runState.port}`} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--accent)", textDecoration: "none" }}>↗ Open in new tab</a>
+                      </div>
+                      <iframe src={`http://localhost:${runState.port}`} style={{ width: "100%", height: 400, border: "none", background: "#fff" }} title="App Preview" />
                     </div>
-                    <iframe src={`http://localhost:${runState.port}`} style={{ width: "100%", height: 400, border: "none", background: "#fff" }} title="App Preview" />
-                  </div>
+                  </>
                 )}
                 {runState.status === "starting" && (
                   <div style={{ marginBottom: 16, padding: 20, textAlign: "center", background: "var(--bg-tertiary)", borderRadius: 12, border: "1px solid var(--border)" }}>
