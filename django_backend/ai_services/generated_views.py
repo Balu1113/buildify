@@ -1219,8 +1219,52 @@ def preview_project(request, project_id, preview_path=""):
 
     preview_path = preview_path.lstrip("/")
 
+        # ---------------------------------------------------------
+    # Select generated backend or frontend process
+    # ---------------------------------------------------------
+    backend_process = None
+    frontend_process = None
+
+    for info in process_info["processes"]:
+        if info["script"].endswith("manage.py"):
+            backend_process = info
+
+        elif info["script"].endswith("package.json"):
+            frontend_process = info
+
+    # API requests go to the generated Django backend.
+    is_backend_request = (
+        preview_path == "api"
+        or preview_path.startswith("api/")
+    )
+
+    if is_backend_request:
+        target_process = backend_process
+    else:
+        target_process = frontend_process
+
+    if target_process is None:
+        return Response(
+            {
+                "error": (
+                    "Generated backend process is not running."
+                    if is_backend_request
+                    else "Frontend preview process is not running."
+                ),
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    target_port = target_process["port"]
+
+    if not preview_path:
+        preview_path = "static/"
+
+    # ---------------------------------------------------------
+    # Build target URL
+    # ---------------------------------------------------------
     target_url = (
-        f"http://127.0.0.1:{frontend_port}/"
+        f"http://127.0.0.1:{target_port}/"
         f"{preview_path}"
     )
 
@@ -1233,8 +1277,7 @@ def preview_project(request, project_id, preview_path=""):
         "Content-Type",
         "Accept",
         "User-Agent",
-        "Referer",
-        "Origin",
+        "Authorization",
     ):
         value = request.META.get(
             f"HTTP_{header_name.upper().replace('-', '_')}"

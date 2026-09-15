@@ -736,7 +736,7 @@ const ProjectList = () => {
                       <span style={{ fontSize: 11, color: "var(--text-muted)" }}>🌐 Preview — localhost:{runState.port}</span>
                       <a href={`http://localhost:${runState.port}`} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--accent)", textDecoration: "none" }}>↗ Open in new tab</a>
                     </div>
-                    <iframe src={`http://localhost:${runState.port}`} style={{ width: "100%", height: 400, border: "none", background: "#fff" }} title="App Preview" />
+                    <iframe  src={`${API_BASE_URL}/generated/${projectId}/preview/`} title="Project Preview" style={{ width: "100%", height: 400, border: "none", background: "#fff" }} />
                   </div>
                 )}
                 {files.length > 0 ? (
