@@ -148,25 +148,83 @@ def _detect_port_from_files(project_dir):
 def _get_run_command(project_dir, script, port=None):
     if script.endswith("manage.py"):
         req_dir = _get_requirements_dir(project_dir, script)
+
         if not req_dir:
-            req_dir = os.path.dirname(os.path.join(project_dir, script))
+            req_dir = os.path.dirname(
+                os.path.join(project_dir, script)
+            )
+
         if req_dir:
-            req_file = os.path.join(req_dir, "requirements.txt")
+            req_file = os.path.join(
+                req_dir,
+                "requirements.txt",
+            )
+
             if not os.path.exists(req_file):
                 with open(req_file, "w") as f:
                     f.write("django\n")
+
             try:
                 subprocess.run(
-                    [PYTHON, "-m", "pip", "install", "-r", req_file, "-q"],
+                    [
+                        PYTHON,
+                        "-m",
+                        "pip",
+                        "install",
+                        "-r",
+                        req_file,
+                        "-q",
+                    ],
                     cwd=req_dir,
                     timeout=120,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    creationflags=getattr(
+                        subprocess,
+                        "CREATE_NO_WINDOW",
+                        0,
+                    ),
                 )
             except Exception:
                 pass
-        return [PYTHON, script, "runserver", f"0.0.0.0:{port or 0}", "--noreload"]
+
+        # Create generated project's static directory
+        os.makedirs(
+            os.path.join(
+                project_dir,
+                "static",
+            ),
+            exist_ok=True,
+        )
+
+        # Apply generated project's migrations
+        try:
+            subprocess.run(
+                [
+                    PYTHON,
+                    script,
+                    "migrate",
+                    "--noinput",
+                ],
+                cwd=req_dir,
+                timeout=120,
+                check=False,
+                creationflags=getattr(
+                    subprocess,
+                    "CREATE_NO_WINDOW",
+                    0,
+                ),
+            )
+        except Exception:
+            pass
+
+        return [
+            PYTHON,
+            script,
+            "runserver",
+            f"0.0.0.0:{port or 0}",
+            "--noreload",
+        ]
     if script.endswith(".py"):
         req_dir = _get_requirements_dir(project_dir, script)
         if req_dir:
