@@ -96,7 +96,11 @@ const Terminal = ({ terminalInfo, preparationStatus }) => {
                 borderTop: "1px solid var(--border)"
               }}
             >
-              <div style={{ animation: "pulse 1s ease-in-out infinite" }}>⏳ Setting up dependencies...</div>
+              {preparationStatus.output?.length ? (
+                preparationStatus.output.join("")
+              ) : (
+                <div style={{ animation: "pulse 1s ease-in-out infinite" }}>⏳ Waiting for command output...</div>
+              )}
             </div>
           </div>
         )}

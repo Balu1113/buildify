@@ -15,4 +15,6 @@ urlpatterns = [
     path("generated/<str:project_id>/run/", generated_views.run_project, name="generated-run"),
     path("generated/<str:project_id>/stop/", generated_views.stop_project, name="generated-stop"),
     path("generated/<str:project_id>/status/", generated_views.run_status, name="generated-status"),
+    path("generated/<str:project_id>/preview/",generated_views.preview_project,name="preview-project",),
+    path("generated/<str:project_id>/preview/<path:preview_path>",generated_views.preview_project,name="preview-project-path",),
 ]

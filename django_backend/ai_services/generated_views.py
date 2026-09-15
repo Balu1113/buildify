@@ -12,6 +12,12 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
 
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
+
+from django.http import HttpResponse
+
 from . import gemini_ai
 from projects.models import GeneratedFile, Project
 from projects.storage import (
@@ -329,6 +335,7 @@ def _prepare_frontend(project_id, project_dir, script):
                     f"{npm_command} install "
                     "--include=dev --no-audit --no-fund"
                 ),
+                "output": [],
             }
 
         print(
@@ -337,7 +344,7 @@ def _prepare_frontend(project_id, project_dir, script):
             flush=True,
         )
 
-        result = subprocess.run(
+        process = subprocess.Popen(
             [
                 npm_command,
                 "install",
@@ -346,9 +353,10 @@ def _prepare_frontend(project_id, project_dir, script):
                 "--no-fund",
             ],
             cwd=package_dir,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=300,
+            bufsize=1,
             creationflags=getattr(
                 subprocess,
                 "CREATE_NO_WINDOW",
@@ -356,12 +364,16 @@ def _prepare_frontend(project_id, project_dir, script):
             ),
         )
 
-        if result.returncode != 0:
-            details = (
-                result.stderr
-                or result.stdout
-                or "npm install failed"
-            ).strip()
+        for line in iter(process.stdout.readline, ""):
+            _append_preview_output(project_id, line)
+
+        process.stdout.close()
+        result_code = process.wait(timeout=300)
+
+        if result_code != 0:
+            job = _get_preview_job(project_id) or {}
+            details = "".join(job.get("output", [])) or "npm install failed"
+            details = details.strip()
 
             print(
                 f"[Buildify] npm install failed for project "
@@ -379,6 +391,8 @@ def _prepare_frontend(project_id, project_dir, script):
                         "Failed to install React frontend dependencies."
                     ),
                     "package_dir": package_dir,
+                    "command": job.get("command"),
+                    "output": job.get("output", []),
                 }
 
             return
@@ -425,6 +439,7 @@ def _prepare_frontend(project_id, project_dir, script):
                 "stage": "dependencies_installed",
                 "message": "Frontend dependencies are ready.",
                 "package_dir": package_dir,
+                "output": (_get_preview_job(project_id) or {}).get("output", []),
             }
 
     except subprocess.TimeoutExpired:
@@ -437,6 +452,7 @@ def _prepare_frontend(project_id, project_dir, script):
                 "message": (
                     "Frontend dependency installation timed out."
                 ),
+                "output": (_get_preview_job(project_id) or {}).get("output", []),
             }
 
     except Exception as error:
@@ -453,6 +469,7 @@ def _prepare_frontend(project_id, project_dir, script):
                 "stage": "npm_install",
                 "error": str(error),
                 "message": "Frontend preparation failed.",
+                "output": (_get_preview_job(project_id) or {}).get("output", []),
             }
 
 
@@ -461,6 +478,14 @@ def _get_preview_job(project_id):
         job = _preview_jobs.get(project_id)
 
     return dict(job) if job else None
+
+
+def _append_preview_output(project_id, line):
+    with _preview_jobs_lock:
+        job = _preview_jobs.get(project_id)
+        if job is not None:
+            job.setdefault("output", []).append(line)
+            job["output"] = job["output"][-200:]
 
 def _start_frontend_preparation(project_id, project_dir, script):
     """Start frontend dependency installation without blocking the request."""
@@ -1006,11 +1031,7 @@ def run_status(request, project_id):
 
         if job:
             if job.get("status") == "preparing":
-                return Response({
-                    "status": "preparing",
-                    "stage": job.get("stage"),
-                    "message": "Preparing the frontend...",
-                })
+                return Response(job)
 
             if job.get("status") == "ready":
                 project, project_dir = _project_workspace(
@@ -1089,12 +1110,161 @@ def run_status(request, project_id):
             project_id,
             os.path.join(
                 PROJECTS_DIR,
-                f"project_{project_id}",
+                str(project_id),
             ),
             info,
         ),
     })
 
+@api_view(["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+def preview_project(request, project_id, preview_path=""):
+    """
+    Proxy requests from the Buildify browser to the generated
+    project's running frontend process.
+    """
+
+    project, project_dir = _project_workspace(
+        project_id,
+        materialize=False,
+    )
+
+    if project is None:
+        return Response(
+            {"error": "Project not found"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    process_info = _running_processes.get(project_id)
+
+    if not process_info:
+        return Response(
+            {
+                "error": "Preview is not running",
+                "status": "not_running",
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    frontend_process = None
+
+    for info in process_info["processes"]:
+        if info["script"].endswith("package.json"):
+            frontend_process = info
+            break
+
+    if frontend_process is None:
+        return Response(
+            {
+                "error": "Frontend preview process is not running",
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    frontend_port = frontend_process["port"]
+
+    preview_path = preview_path.lstrip("/")
+
+    target_url = (
+        f"http://127.0.0.1:{frontend_port}/"
+        f"{preview_path}"
+    )
+
+    if request.META.get("QUERY_STRING"):
+        target_url += f"?{request.META['QUERY_STRING']}"
+
+    headers = {}
+
+    for header_name in (
+        "Content-Type",
+        "Accept",
+        "User-Agent",
+        "Referer",
+        "Origin",
+    ):
+        value = request.META.get(
+            f"HTTP_{header_name.upper().replace('-', '_')}"
+        )
+
+        if value:
+            headers[header_name] = value
+
+    body = request.body if request.method not in {
+        "GET",
+        "HEAD",
+    } else None
+
+    proxy_request = Request(
+        target_url,
+        data=body,
+        headers=headers,
+        method=request.method,
+    )
+
+    try:
+        with urlopen(
+            proxy_request,
+            timeout=30,
+        ) as upstream:
+
+            response_body = upstream.read()
+
+            content_type = upstream.headers.get(
+                "Content-Type",
+                "text/plain",
+            )
+
+            response = HttpResponse(
+                response_body,
+                status=upstream.status,
+                content_type=content_type,
+            )
+
+            for header_name in (
+                "Cache-Control",
+                "ETag",
+                "Last-Modified",
+            ):
+                value = upstream.headers.get(header_name)
+
+                if value:
+                    response[header_name] = value
+
+            return response
+
+    except HTTPError as error:
+        try:
+            response_body = error.read()
+        except Exception:
+            response_body = str(error).encode()
+
+        return HttpResponse(
+            response_body,
+            status=error.code,
+            content_type=error.headers.get(
+                "Content-Type",
+                "text/plain",
+            ),
+        )
+
+    except URLError as error:
+        return Response(
+            {
+                "error": "Unable to connect to preview process",
+                "detail": str(error.reason),
+                "port": frontend_port,
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    except Exception as error:
+        return Response(
+            {
+                "error": "Preview proxy failed",
+                "detail": str(error),
+            },
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+    
 @api_view(["POST"])
 def modify_project(request, project_id):
     project, project_dir = _project_workspace(project_id)
