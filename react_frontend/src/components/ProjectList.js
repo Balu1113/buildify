@@ -66,12 +66,13 @@ const ModelProviderSelector = ({ value, onChange, disabled = false }) => {
   const activeGroup = AI_MODELS.find((group) => group.provider === selectedProvider) || AI_MODELS[0];
   const activeOptions = activeGroup.models;
   const selectedModel = activeOptions.some((model) => model.value === value) ? value : activeOptions[0]?.value;
+  const isKnownModel = AI_MODELS.some((group) => group.models.some((model) => model.value === value));
 
   useEffect(() => {
-    if (!disabled && selectedModel !== value) {
+    if (!disabled && !isKnownModel && selectedModel && selectedModel !== value) {
       onChange(selectedModel);
     }
-  }, [selectedModel, value, disabled, onChange]);
+  }, [selectedModel, value, disabled, isKnownModel, onChange]);
 
   const handleProviderChange = (nextProvider) => {
     const nextGroup = AI_MODELS.find((group) => group.provider === nextProvider) || AI_MODELS[0];
@@ -227,6 +228,7 @@ const ProjectList = () => {
   const modifyEndRef = useRef(null);
   const autoRunProjectRef = useRef(null);
   const previewSignatureRef = useRef(null);
+  const lastPatchedModelRef = useRef(null);
 
   useEffect(() => { fetchProjects(); return () => { if (pollRef.current) clearInterval(pollRef.current); if (runPollRef.current) clearInterval(runPollRef.current); }; }, []);
 
@@ -320,10 +322,13 @@ const ProjectList = () => {
     const ai_model = value;
     setSelectedAiModel(ai_model);
     if (!selectedProject) return;
+    if (lastPatchedModelRef.current === `${selectedProject}:${ai_model}`) return;
+    lastPatchedModelRef.current = `${selectedProject}:${ai_model}`;
     try {
       await projectAPI.patch(selectedProject, { ai_model });
       showToast("AI model updated. It applies to the next pipeline run.", "info");
     } catch {
+      lastPatchedModelRef.current = null;
       showToast("Unable to update the AI model.", "error");
     }
   };
