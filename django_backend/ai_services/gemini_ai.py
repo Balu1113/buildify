@@ -19,6 +19,7 @@ from openai import OpenAI
 API_KEY = settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
 MODEL_NAME = settings.GEMINI_MODEL_NAME
 FALLBACK_MODEL_NAMES = os.getenv("GEMINI_FALLBACK_MODELS", "")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # API timeout for Gemini calls (must be less than gunicorn's 30-second worker timeout)
 GEMINI_TIMEOUT_SECONDS = 20
@@ -144,6 +145,16 @@ def _should_try_fallback(error: Exception) -> bool:
     return any(marker in message for marker in retryable_markers)
 
 
+def _is_openrouter_model(model_name: str) -> bool:
+    return (
+        "/" in model_name
+        and model_name not in {
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+        }
+    )
+
+
 def _generate_content(contents):
     """Generate content, falling back when the current model is exhausted."""
     client = get_client()
@@ -179,19 +190,22 @@ def generate_response(prompt: str, model_name: Optional[str] = None) -> str:
         if model_name:
             model_name = LEGACY_MODEL_ALIASES.get(model_name, model_name)
             if not model_name.startswith(("gemini-", "gemma-")):
-                base_url = (
-                    "https://api.groq.com/openai/v1"
-                    if model_name in {
-                        "openai/gpt-oss-120b",
-                        "openai/gpt-oss-20b",
-                    }
-                    else "https://integrate.api.nvidia.com/v1"
-                )
-                api_key = (
-                    os.getenv("GROQ_API_KEY")
-                    if base_url.startswith("https://api.groq")
-                    else os.getenv("OPENAI_API_KEY")
-                )
+                is_groq_model = model_name in {
+                    "openai/gpt-oss-120b",
+                    "openai/gpt-oss-20b",
+                }
+                is_openrouter_model = _is_openrouter_model(model_name)
+                if is_groq_model:
+                    base_url = "https://api.groq.com/openai/v1"
+                    api_key = os.getenv("GROQ_API_KEY")
+                elif is_openrouter_model:
+                    base_url = OPENROUTER_BASE_URL
+                    api_key = getattr(settings, "OPENROUTER_API_KEY", None) or os.getenv("OPENROUTER_API_KEY")
+                    if not api_key:
+                        raise ValueError("OPENROUTER_API_KEY is not set.")
+                else:
+                    base_url = "https://integrate.api.nvidia.com/v1"
+                    api_key = os.getenv("OPENAI_API_KEY")
                 completion = OpenAI(
                     base_url=base_url,
                     api_key=api_key,
