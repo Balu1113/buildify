@@ -199,7 +199,24 @@ def _get_run_command(project_dir, script, port=None):
 
         # Apply generated project's migrations
         try:
-            subprocess.run(
+            migration_env = os.environ.copy()
+
+            migration_env.pop(
+                "DJANGO_SETTINGS_MODULE",
+                None,
+            )
+
+            settings_module = _detect_settings_module(
+                project_dir,
+                script,
+            )
+
+            if settings_module:
+                migration_env["DJANGO_SETTINGS_MODULE"] = settings_module
+
+            migration_env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+            migrate_result = subprocess.run(
                 [
                     PYTHON,
                     script,
@@ -207,7 +224,10 @@ def _get_run_command(project_dir, script, port=None):
                     "--noinput",
                 ],
                 cwd=req_dir,
+                env=migration_env,
                 timeout=120,
+                text=True,
+                capture_output=True,
                 check=False,
                 creationflags=getattr(
                     subprocess,
@@ -215,8 +235,36 @@ def _get_run_command(project_dir, script, port=None):
                     0,
                 ),
             )
-        except Exception:
-            pass
+
+            print(
+                "[Buildify] Generated Django migration stdout:",
+                flush=True,
+            )
+            print(
+                migrate_result.stdout or "",
+                flush=True,
+            )
+
+            print(
+                "[Buildify] Generated Django migration stderr:",
+                flush=True,
+            )
+            print(
+                migrate_result.stderr or "",
+                flush=True,
+            )
+
+            if migrate_result.returncode != 0:
+                raise RuntimeError(
+                    "Generated Django migrations failed "
+                    f"with exit code {migrate_result.returncode}"
+                )
+
+        except Exception as error:
+            print(
+                f"[Buildify] Generated Django migration error: {error}",
+                flush=True,
+            )
 
         return [
             PYTHON,
