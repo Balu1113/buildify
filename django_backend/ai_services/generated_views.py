@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import shutil
 
 from django.conf import settings
 from rest_framework.decorators import api_view
@@ -13,7 +14,6 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from django.http import HttpResponse
@@ -212,7 +212,7 @@ def _get_run_command(project_dir, script, port=None):
         return command
     return [PYTHON, script]
 
-import shutil
+
 def _ensure_node_dependencies(project_dir, script):
     """Validate the frontend and return its package directory."""
     if not script.endswith("package.json"):
@@ -277,201 +277,6 @@ def _ensure_node_dependencies(project_dir, script):
 
     return package_dir
 
-def _prepare_frontend(project_id, project_dir, script):
-    """Install frontend dependencies only when node_modules is missing."""
-
-    try:
-        package_dir = _ensure_node_dependencies(
-            project_dir,
-            script,
-        )
-
-        if isinstance(package_dir, dict):
-            with _preview_jobs_lock:
-                _preview_jobs[project_id] = package_dir
-            return
-
-        npm_command = "npm.cmd" if os.name == "nt" else "npm"
-
-        node_modules_dir = os.path.join(
-            package_dir,
-            "node_modules",
-        )
-
-        # ---------------------------------------------------------
-        # Dependencies already exist
-        # ---------------------------------------------------------
-        if os.path.isdir(node_modules_dir):
-            print(
-                f"[Buildify] node_modules already exists for "
-                f"project {project_id}: {node_modules_dir}",
-                flush=True,
-            )
-
-            with _preview_jobs_lock:
-                _preview_jobs[project_id] = {
-                    "status": "ready",
-                    "severity": "ready",
-                    "error": None,
-                    "stage": "dependencies_installed",
-                    "message": "Frontend dependencies are already installed.",
-                    "package_dir": package_dir,
-                }
-
-            return
-
-        # ---------------------------------------------------------
-        # Dependencies don't exist → install them
-        # ---------------------------------------------------------
-        with _preview_jobs_lock:
-            _preview_jobs[project_id] = {
-                "status": "preparing",
-                "severity": "in-progress",
-                "error": None,
-                "stage": "npm_install",
-                "message": "Installing React frontend dependencies.",
-                "package_dir": package_dir,
-                "command": (
-                    f"{npm_command} install "
-                    "--include=dev --no-audit --no-fund"
-                ),
-                "output": [],
-            }
-
-        print(
-            f"[Buildify] Starting npm install for project "
-            f"{project_id}",
-            flush=True,
-        )
-
-        process = subprocess.Popen(
-            [
-                npm_command,
-                "install",
-                "--include=dev",
-                "--no-audit",
-                "--no-fund",
-            ],
-            cwd=package_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            creationflags=getattr(
-                subprocess,
-                "CREATE_NO_WINDOW",
-                0,
-            ),
-        )
-
-        for line in iter(process.stdout.readline, ""):
-            _append_preview_output(project_id, line)
-
-        process.stdout.close()
-        result_code = process.wait(timeout=300)
-
-        if result_code != 0:
-            job = _get_preview_job(project_id) or {}
-            details = "".join(job.get("output", [])) or "npm install failed"
-            details = details.strip()
-
-            print(
-                f"[Buildify] npm install failed for project "
-                f"{project_id}: {details[-4000:]}",
-                flush=True,
-            )
-
-            with _preview_jobs_lock:
-                _preview_jobs[project_id] = {
-                    "status": "failed",
-                    "severity": "error",
-                    "stage": "npm_install",
-                    "error": details[-4000:],
-                    "message": (
-                        "Failed to install React frontend dependencies."
-                    ),
-                    "package_dir": package_dir,
-                    "command": job.get("command"),
-                    "output": job.get("output", []),
-                }
-
-            return
-
-        # ---------------------------------------------------------
-        # Verify node_modules was created
-        # ---------------------------------------------------------
-        if not os.path.isdir(node_modules_dir):
-            with _preview_jobs_lock:
-                _preview_jobs[project_id] = {
-                    "status": "failed",
-                    "severity": "error",
-                    "stage": "npm_install",
-                    "error": (
-                        "node_modules directory was not found "
-                        "after npm install."
-                    ),
-                    "message": (
-                        "npm install completed but frontend "
-                        "dependencies were not created."
-                    ),
-                    "package_dir": package_dir,
-                }
-
-            return
-
-        print(
-            f"[Buildify] npm install completed for project "
-            f"{project_id}",
-            flush=True,
-        )
-
-        print(
-            f"[Buildify] node_modules stored at: "
-            f"{node_modules_dir}",
-            flush=True,
-        )
-
-        with _preview_jobs_lock:
-            _preview_jobs[project_id] = {
-                "status": "ready",
-                "severity": "ready",
-                "error": None,
-                "stage": "dependencies_installed",
-                "message": "Frontend dependencies are ready.",
-                "package_dir": package_dir,
-                "output": (_get_preview_job(project_id) or {}).get("output", []),
-            }
-
-    except subprocess.TimeoutExpired:
-        with _preview_jobs_lock:
-            _preview_jobs[project_id] = {
-                "status": "failed",
-                "severity": "error",
-                "stage": "npm_install",
-                "error": "npm install timed out after 300 seconds",
-                "message": (
-                    "Frontend dependency installation timed out."
-                ),
-                "output": (_get_preview_job(project_id) or {}).get("output", []),
-            }
-
-    except Exception as error:
-        print(
-            f"[Buildify] Frontend preparation error for project "
-            f"{project_id}: {error}",
-            flush=True,
-        )
-
-        with _preview_jobs_lock:
-            _preview_jobs[project_id] = {
-                "status": "failed",
-                "severity": "error",
-                "stage": "npm_install",
-                "error": str(error),
-                "message": "Frontend preparation failed.",
-                "output": (_get_preview_job(project_id) or {}).get("output", []),
-            }
-
 
 def _get_preview_job(project_id):
     with _preview_jobs_lock:
@@ -479,7 +284,63 @@ def _get_preview_job(project_id):
 
     return dict(job) if job else None
 
+def _preview_state_path(project_dir):
+    state_dir = os.path.join(
+        project_dir,
+        ".buildify",
+    )
 
+    os.makedirs(
+        state_dir,
+        exist_ok=True,
+    )
+
+    return os.path.join(
+        state_dir,
+        "frontend_status.json",
+    )
+
+
+def _write_preview_state(project_dir, state):
+    state_path = _preview_state_path(project_dir)
+
+    temp_path = f"{state_path}.tmp"
+
+    with open(
+        temp_path,
+        "w",
+        encoding="utf-8",
+    ) as state_file:
+        json.dump(
+            state,
+            state_file,
+        )
+
+    os.replace(
+        temp_path,
+        state_path,
+    )
+
+
+def _read_preview_state(project_dir):
+    state_path = _preview_state_path(project_dir)
+
+    if not os.path.exists(state_path):
+        return None
+
+    try:
+        with open(
+            state_path,
+            "r",
+            encoding="utf-8",
+        ) as state_file:
+            return json.load(state_file)
+    except (
+        OSError,
+        json.JSONDecodeError,
+    ):
+        return None
+    
 def _append_preview_output(project_id, line):
     with _preview_jobs_lock:
         job = _preview_jobs.get(project_id)
@@ -488,34 +349,112 @@ def _append_preview_output(project_id, line):
             job["output"] = job["output"][-200:]
 
 def _start_frontend_preparation(project_id, project_dir, script):
-    """Start frontend dependency installation without blocking the request."""
+    """Start npm installation in a separate OS process."""
 
-    existing = _get_preview_job(project_id)
-
-    if existing and existing.get("status") in {"preparing", "ready"}:
-        return existing
-
-    # Set preparing BEFORE starting the thread.
-    with _preview_jobs_lock:
-        _preview_jobs[project_id] = {
-            "status": "preparing",
-            "severity": "in-progress",
-            "error": None,
-            "stage": "npm_install",
-            "message": "Installing React frontend dependencies.",
-        }
-
-    thread = threading.Thread(
-        target=_prepare_frontend,
-        args=(project_id, project_dir, script),
-        daemon=True,
-        name=f"frontend-prepare-{project_id}",
+    package_dir = os.path.dirname(
+        os.path.join(
+            project_dir,
+            script,
+        )
     )
 
-    thread.start()
+    node_modules_dir = os.path.join(
+        package_dir,
+        "node_modules",
+    )
 
-    return _get_preview_job(project_id)
+    # ---------------------------------------------------------
+    # Already installed
+    # ---------------------------------------------------------
+    if os.path.isdir(node_modules_dir):
+        state = {
+            "status": "ready",
+            "severity": "ready",
+            "error": None,
+            "stage": "dependencies_installed",
+            "message": "Frontend dependencies are already installed.",
+            "package_dir": package_dir,
+        }
 
+        _write_preview_state(
+            project_dir,
+            state,
+        )
+
+        with _preview_jobs_lock:
+            _preview_jobs[project_id] = state
+
+        return state
+
+    # ---------------------------------------------------------
+    # Mark as preparing BEFORE starting worker
+    # ---------------------------------------------------------
+    state = {
+        "status": "preparing",
+        "severity": "in-progress",
+        "error": None,
+        "stage": "npm_install",
+        "message": "Installing React frontend dependencies.",
+        "package_dir": package_dir,
+    }
+
+    _write_preview_state(
+        project_dir,
+        state,
+    )
+
+    with _preview_jobs_lock:
+        _preview_jobs[project_id] = state
+
+    try:
+        process = subprocess.Popen(
+            [
+                PYTHON,
+                "-m",
+                "ai_services.preview_worker",
+                project_dir,
+                script,
+            ],
+            cwd=os.path.dirname(
+                os.path.dirname(
+                    os.path.abspath(__file__)
+                )
+            ),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(
+                subprocess,
+                "CREATE_NO_WINDOW",
+                0,
+            ),
+        )
+
+        print(
+            f"[Buildify] Started frontend preparation worker "
+            f"PID={process.pid} for project {project_id}",
+            flush=True,
+        )
+
+        return state
+
+    except Exception as error:
+        state = {
+            "status": "failed",
+            "severity": "error",
+            "stage": "npm_install",
+            "error": str(error),
+            "message": "Failed to start frontend preparation.",
+        }
+
+        _write_preview_state(
+            project_dir,
+            state,
+        )
+
+        with _preview_jobs_lock:
+            _preview_jobs[project_id] = state
+
+        return state
 
 def _start_process(project_id, project_dir, script):
     if project_id in _running_processes:
@@ -1026,6 +965,24 @@ def stop_project(request, project_id):
 
 @api_view(["GET"])
 def run_status(request, project_id):
+    project, project_dir = _project_workspace(
+        project_id,
+        materialize=False,
+    )
+
+    if project is None:
+        return Response(
+            {"error": "Project not found"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    filesystem_job = _read_preview_state(
+        project_dir
+    )
+
+    if filesystem_job:
+        with _preview_jobs_lock:
+            _preview_jobs[project_id] = filesystem_job
     if project_id not in _running_processes:
         job = _get_preview_job(project_id)
 
