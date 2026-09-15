@@ -428,32 +428,171 @@ const ProjectList = () => {
   };
 
   const startRunPolling = () => {
-    if (runPollRef.current) clearInterval(runPollRef.current);
-    runPollRef.current = setInterval(async () => {
-      try {
-        const r = await generatedAPI.status(`project_${selectedProject}`);
-        if (r.data.terminal) setTerminalInfo(r.data.terminal);
-        
-        // Handle preparation status
-        if (r.data.status === "preparing") {
-          setPreparationStatus(r.data);
-          setRunState({ status: "starting", port: null });
-        } else if (r.data.status === "running") {
-          setPreparationStatus(null);
-          setRunState({ status: "running", port: r.data.port });
-        } else if (r.data.status === "stopped" || r.data.status === "not_running") {
-          setRunState({ status: "idle", port: null });
-          setTerminalInfo(null);
-          setPreparationStatus(null);
-          clearInterval(runPollRef.current); runPollRef.current = null;
-        }
-      } catch {
-        setRunState({ status: "idle", port: null });
-        setPreparationStatus(null);
-        clearInterval(runPollRef.current); runPollRef.current = null;
+  if (runPollRef.current) clearInterval(runPollRef.current);
+
+  runPollRef.current = setInterval(async () => {
+    try {
+      const r = await generatedAPI.status(`project_${selectedProject}`);
+
+      if (r.data.terminal) {
+        setTerminalInfo(r.data.terminal);
       }
-    }, 5000);
-  };
+
+      // Frontend dependencies are still being installed
+      if (r.data.status === "preparing") {
+        setPreparationStatus(r.data);
+        setRunState({
+          status: "starting",
+          port: null,
+        });
+        return;
+      }
+
+      // Dependencies finished.
+      // Automatically start the project — no refresh/run click required.
+      if (r.data.status === "ready") {
+        setPreparationStatus({
+          ...r.data,
+          status: "preparing",
+          stage: "starting",
+          message: "Dependencies ready. Starting the application...",
+        });
+
+        setRunState({
+          status: "starting",
+          port: null,
+        });
+
+        // Stop this polling interval before starting the app.
+        clearInterval(runPollRef.current);
+        runPollRef.current = null;
+
+        try {
+          const runResponse = await generatedAPI.run(
+            `project_${selectedProject}`
+          );
+
+          if (runResponse.data.terminal) {
+            setTerminalInfo(runResponse.data.terminal);
+          }
+
+          if (runResponse.data.status === "running") {
+            setPreparationStatus(null);
+
+            setRunState({
+              status: "running",
+              port: runResponse.data.port,
+            });
+
+            startRunPolling();
+
+            showToast(
+              `App running on port ${runResponse.data.port}`,
+              "success"
+            );
+
+            return;
+          }
+
+          if (runResponse.data.status === "preparing") {
+            setPreparationStatus(runResponse.data);
+            setRunState({
+              status: "starting",
+              port: null,
+            });
+
+            startRunPolling();
+            return;
+          }
+
+          throw new Error(
+            runResponse.data.error ||
+              runResponse.data.message ||
+              "Failed to start the application."
+          );
+        } catch (runError) {
+          const data = runError.response?.data;
+
+          setRunState({
+            status: "idle",
+            port: null,
+          });
+
+          setPreparationStatus(null);
+
+          setTerminalInfo(data?.terminal || null);
+
+          showToast(
+            data?.output ||
+              data?.error ||
+              "Failed to start the application.",
+            "error"
+          );
+        }
+
+        return;
+      }
+
+      // Application is running
+      if (r.data.status === "running") {
+        setPreparationStatus(null);
+
+        setRunState({
+          status: "running",
+          port: r.data.port,
+        });
+
+        return;
+      }
+
+      // Application stopped
+      if (
+        r.data.status === "stopped" ||
+        r.data.status === "not_running"
+      ) {
+        setRunState({
+          status: "idle",
+          port: null,
+        });
+
+        setTerminalInfo(null);
+        setPreparationStatus(null);
+
+        clearInterval(runPollRef.current);
+        runPollRef.current = null;
+      }
+
+      // Preparation/start failure
+      if (
+        r.data.status === "failed" ||
+        r.data.status === "environment-unavailable" ||
+        r.data.status === "not-ready"
+      ) {
+        setRunState({
+          status: "idle",
+          port: null,
+        });
+
+        setPreparationStatus(null);
+
+        clearInterval(runPollRef.current);
+        runPollRef.current = null;
+
+        showToast(
+          r.data.message ||
+            r.data.error ||
+            "Unable to start the application.",
+          "error"
+        );
+      }
+    } catch (error) {
+      console.error("Preview status polling failed:", error);
+
+      // Don't immediately kill the UI state because of one
+      // temporary network failure.
+    }
+  }, 2000);
+};
   const handleDelete = async (id) => { try { await projectAPI.delete(id); if (selectedProject === id) { setSelectedProject(null); setTasks([]); setPipeline(null); setFiles([]); } fetchProjects(); } catch {} };
 
   useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [pipeline?.log]);

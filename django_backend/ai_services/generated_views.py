@@ -519,7 +519,7 @@ def _start_process(project_id, project_dir, script):
     if frontend_script:
         job = _get_preview_job(project_id)
 
-        if not job or job.get("status") not in {"ready"}:
+        if not job or job.get("status") != "ready":
             if job and job.get("status") in {
                 "failed",
                 "environment-unavailable",
@@ -714,16 +714,24 @@ def _detect_settings_module(project_dir, manage_script):
     return match.group(1) if match else None
 
 
-def _wait_for_port(port, process, timeout=8):
+def _wait_for_port(port, process, timeout=30):
     deadline = time.time() + timeout
+
     while time.time() < deadline:
+        # Process already exited
         if process.poll() is not None:
             return False
+
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            with socket.create_connection(
+                ("127.0.0.1", port),
+                timeout=0.5,
+            ):
                 return True
+
         except OSError:
-            time.sleep(0.1)
+            time.sleep(0.25)
+
     return False
 
 
@@ -806,9 +814,11 @@ def read_file(request, project_id):
 
 @api_view(["POST"])
 def run_project(request, project_id):
+    # First resolve the project WITHOUT rebuilding/clearing
+    # its runtime workspace.
     project, project_dir = _project_workspace(
         project_id,
-        materialize=True,
+        materialize=False,
     )
 
     if project is None:
@@ -817,6 +827,7 @@ def run_project(request, project_id):
             status=status.HTTP_404_NOT_FOUND,
         )
 
+    # If this project already has a preview process, reuse it.
     if project_id in _running_processes:
         info = _running_processes[project_id]
 
@@ -832,12 +843,23 @@ def run_project(request, project_id):
                     process_info["proc"].pid
                     for process_info in info["processes"]
                 ],
-                "message": (
-                    f"Already running on port {info['port']}"
-                ),
+                "message": f"Already running on port {info['port']}",
             })
 
         _running_processes.pop(project_id, None)
+
+    # Only materialize when we actually need a fresh runtime workspace.
+    preview_job = _get_preview_job(project_id)
+
+    if not preview_job or preview_job.get("status") not in {
+        "preparing",
+        "ready",
+    }:
+        materialize_project(
+            project,
+            project_dir,
+            clear=True,
+        )
 
     run_script = _find_run_script(project_dir)
 
@@ -933,7 +955,7 @@ def run_project(request, project_id):
     ):
         output = "\n".join(
             "".join(
-                process_info["output"][-30:]
+                process_info["output"][-100:]
             )
             for process_info in proc_info["processes"]
         )
@@ -992,10 +1014,45 @@ def run_status(request, project_id):
                 })
 
             if job.get("status") == "ready":
+                project, project_dir = _project_workspace(
+                    project_id,
+                    materialize=False,
+                )
+
+                if project is None:
+                    return Response(
+                        {"error": "Project not found"},
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
+
+                run_script = _find_run_script(project_dir)
+
+                if not run_script:
+                    return Response({
+                        "status": "failed",
+                        "error": "No runnable script found",
+                    })
+
+                result, error = _start_process(
+                    project_id,
+                    project_dir,
+                    run_script,
+                )
+
+                if error:
+                    if isinstance(error, dict):
+                        return Response(error)
+
+                    return Response({
+                        "status": "failed",
+                        "error": str(error),
+                    })
+
                 return Response({
-                    "status": "ready",
-                    "stage": job.get("stage"),
-                    "message": "Frontend dependencies are ready.",
+                    "status": "starting",
+                    "port": result["port"],
+                    "pid": result["pid"],
+                    "message": "Frontend dependencies are ready. Starting the application...",
                 })
 
             return Response(job)
@@ -1038,7 +1095,6 @@ def run_status(request, project_id):
             info,
         ),
     })
-
 
 @api_view(["POST"])
 def modify_project(request, project_id):
