@@ -17,7 +17,7 @@ const Terminal = ({ terminalInfo, preparationStatus }) => {
   }
 
   return (
-    <div style={{ marginBottom: 16, borderRadius: 12, overflow: "hidden", border: "1px solid var(--border)", background: "var(--bg-tertiary)" }}>
+    <div style={{ width: "100%", minWidth: 0, boxSizing: "border-box", marginBottom: 16, borderRadius: 12, overflow: "hidden", border: "1px solid var(--border)", background: "var(--bg-tertiary)" }}>
       <div style={{ padding: "12px 16px", background: "var(--bg-secondary)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, fontWeight: 500, color: "var(--text-primary)" }}>
           <span>💻 Running Commands</span>
@@ -34,7 +34,7 @@ const Terminal = ({ terminalInfo, preparationStatus }) => {
         {isPrepping && (
           <div style={{ borderRadius: 8, background: "var(--bg-tertiary)", border: "1px solid var(--border)", overflow: "hidden" }}>
             {/* Prep header */}
-            <div style={{ padding: "8px 12px", background: "var(--bg-secondary)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ minWidth: 0, padding: "8px 12px", background: "var(--bg-secondary)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
               <span style={{ 
                 display: "inline-block", 
                 width: 8, 
@@ -107,7 +107,7 @@ const Terminal = ({ terminalInfo, preparationStatus }) => {
 
         {/* Process Output */}
         {hasProcesses && terminalInfo.processes.map((process, idx) => (
-          <div key={idx} style={{ borderRadius: 8, background: "var(--bg-tertiary)", border: "1px solid var(--border)", overflow: "hidden" }}>
+          <div key={idx} style={{ minWidth: 0, borderRadius: 8, background: "var(--bg-tertiary)", border: "1px solid var(--border)", overflow: "hidden" }}>
             {/* Command header */}
             <div style={{ padding: "8px 12px", background: "var(--bg-secondary)", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 8 }}>
               <span style={{ 
@@ -118,17 +118,17 @@ const Terminal = ({ terminalInfo, preparationStatus }) => {
                 background: process.status === "running" ? "#10b981" : "#6b7280",
                 animation: process.status === "running" ? "pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite" : "none"
               }} />
-              <span style={{ fontSize: 11, fontWeight: 500, color: "var(--text-muted)" }}>{process.script}</span>
-              <span style={{ fontSize: 10, color: "var(--text-muted)", marginLeft: "auto" }}>PID: {process.pid}</span>
-              <span style={{ fontSize: 10, color: "var(--text-muted)" }}>Port: {process.port}</span>
+              <span style={{ minWidth: 0, overflowWrap: "anywhere", fontSize: 11, fontWeight: 500, color: "var(--text-muted)" }}>{process.script}</span>
+              <span style={{ flexShrink: 0, fontSize: 10, color: "var(--text-muted)", marginLeft: "auto" }}>PID: {process.pid}</span>
+              <span style={{ flexShrink: 0, fontSize: 10, color: "var(--text-muted)" }}>Port: {process.port}</span>
               <span style={{ fontSize: 10, color: process.status === "running" ? "#10b981" : "#6b7280", fontWeight: 500 }}>
                 {process.status === "running" ? "●" : "○"} {process.status}
               </span>
             </div>
 
             {/* Command info */}
-            <div style={{ padding: 12, background: "var(--bg-primary)", borderBottom: "1px solid var(--border)" }}>
-              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>
+              <div style={{ minWidth: 0, padding: 12, background: "var(--bg-primary)", borderBottom: "1px solid var(--border)" }}>
+              <div style={{ overflowWrap: "anywhere", fontSize: 11, color: "var(--text-muted)", marginBottom: 6 }}>
                 <strong>CWD:</strong> {process.cwd}
               </div>
               <div style={{ fontSize: 11, fontFamily: "monospace", color: "var(--accent)", wordBreak: "break-all", whiteSpace: "pre-wrap" }}>
@@ -145,6 +145,7 @@ const Terminal = ({ terminalInfo, preparationStatus }) => {
                   overflowY: "auto",
                   padding: 12,
                   fontFamily: "monospace",
+                  minWidth: 0,
                   fontSize: 10,
                   color: "var(--text-secondary)",
                   lineHeight: 1.4,

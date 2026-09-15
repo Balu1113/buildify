@@ -712,7 +712,7 @@ const ProjectList = () => {
             </div>
 
             {pipeline && (isComplete || files.length > 0 || loading) && (
-              <div className="card" style={{ borderColor: "var(--success)" }}>
+              <div className="card" style={{ minWidth: 0, borderColor: "var(--success)" }}>
                 <div className="card-header">
                   <div><div className="card-title" style={{ color: "var(--success)" }}>✨ Generated Project</div><div className="card-subtitle">{files.length ? `${files.length} files written live` : "Agents are creating files..."}</div></div>
                   <div style={{ display: "flex", gap: 8 }}>
@@ -740,7 +740,7 @@ const ProjectList = () => {
                   </div>
                 )}
                 {files.length > 0 ? (
-                  <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 12 }}>
+                  <div style={{ minWidth: 0, display: "grid", gridTemplateColumns: "minmax(0, 260px) minmax(0, 1fr)", gap: 12 }}>
                     <div style={{ maxHeight: 400, overflowY: "auto", background: "var(--bg-tertiary)", borderRadius: 12, padding: 6 }}>
                       <FileTree tree={buildFileTree(files)} selectedFile={selectedFile} onSelect={handleViewFile} />
                     </div>

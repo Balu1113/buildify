@@ -197,29 +197,26 @@ def _get_run_command(project_dir, script, port=None):
             exist_ok=True,
         )
 
-        # Apply generated project's migrations
+        manage_py = os.path.join(req_dir, "manage.py")
+
+        migration_env = os.environ.copy()
+        migration_env.pop("DJANGO_SETTINGS_MODULE", None)
+
+        settings_module = _detect_settings_module(project_dir, manage_py)
+
+        if settings_module:
+            migration_env["DJANGO_SETTINGS_MODULE"] = settings_module
+
+        migration_env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        print(f"[Buildify] Django migration cwd: {req_dir}", flush=True)
+        print(f"[Buildify] Django manage.py: {manage_py}", flush=True)
+
         try:
-            migration_env = os.environ.copy()
-
-            migration_env.pop(
-                "DJANGO_SETTINGS_MODULE",
-                None,
-            )
-
-            settings_module = _detect_settings_module(
-                project_dir,
-                script,
-            )
-
-            if settings_module:
-                migration_env["DJANGO_SETTINGS_MODULE"] = settings_module
-
-            migration_env["PYTHONDONTWRITEBYTECODE"] = "1"
-
             migrate_result = subprocess.run(
                 [
                     PYTHON,
-                    script,
+                    manage_py,
                     "migrate",
                     "--noinput",
                 ],
@@ -237,27 +234,21 @@ def _get_run_command(project_dir, script, port=None):
             )
 
             print(
-                "[Buildify] Generated Django migration stdout:",
-                flush=True,
-            )
-            print(
-                migrate_result.stdout or "",
+                f"[Buildify] Generated Django migration stdout:\n"
+                f"{migrate_result.stdout}",
                 flush=True,
             )
 
             print(
-                "[Buildify] Generated Django migration stderr:",
-                flush=True,
-            )
-            print(
-                migrate_result.stderr or "",
+                f"[Buildify] Generated Django migration stderr:\n"
+                f"{migrate_result.stderr}",
                 flush=True,
             )
 
             if migrate_result.returncode != 0:
                 raise RuntimeError(
-                    "Generated Django migrations failed "
-                    f"with exit code {migrate_result.returncode}"
+                    "Generated Django migrations failed with "
+                    f"exit code {migrate_result.returncode}"
                 )
 
         except Exception as error:
@@ -265,6 +256,7 @@ def _get_run_command(project_dir, script, port=None):
                 f"[Buildify] Generated Django migration error: {error}",
                 flush=True,
             )
+            raise
 
         return [
             PYTHON,
