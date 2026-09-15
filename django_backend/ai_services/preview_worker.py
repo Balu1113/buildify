@@ -172,8 +172,29 @@ def ensure_frontend_dependencies(project_dir, script):
         ],
         cwd=package_dir,
         text=True,
+        capture_output=True,
     )
 
+    print(
+    "[Buildify Worker] npm stdout:",
+    flush=True,
+    )
+
+    print(
+        result.stdout or "",
+        flush=True,
+    )
+
+    print(
+        "[Buildify Worker] npm stderr:",
+        flush=True,
+    )
+
+    print(
+        result.stderr or "",
+        flush=True,
+    )
+    
     if result.returncode != 0:
         write_state(
             project_dir,
