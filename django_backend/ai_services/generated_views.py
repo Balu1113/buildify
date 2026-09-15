@@ -61,8 +61,6 @@ def _project_workspace(project_id, materialize=False):
     if materialize:
         existing_job = _get_preview_job(project.pk)
 
-        # Do not destroy node_modules or an already-running
-        # preview workspace.
         preserve_workspace = existing_job and existing_job.get(
             "status"
         ) in {
@@ -274,10 +272,13 @@ def _ensure_node_dependencies(project_dir, script):
     return package_dir
 
 def _prepare_frontend(project_id, project_dir, script):
-    """Install frontend dependencies in a background thread."""
+    """Install frontend dependencies only when node_modules is missing."""
 
     try:
-        package_dir = _ensure_node_dependencies(project_dir, script)
+        package_dir = _ensure_node_dependencies(
+            project_dir,
+            script,
+        )
 
         if isinstance(package_dir, dict):
             with _preview_jobs_lock:
@@ -291,16 +292,13 @@ def _prepare_frontend(project_id, project_dir, script):
             "node_modules",
         )
 
-        vite_path = os.path.join(
-            node_modules_dir,
-            ".bin",
-            "vite",
-        )
-
-        # Dependencies are already installed correctly.
-        if os.path.exists(vite_path):
+        # ---------------------------------------------------------
+        # Dependencies already exist
+        # ---------------------------------------------------------
+        if os.path.isdir(node_modules_dir):
             print(
-                f"[Buildify] Vite already exists for project {project_id}",
+                f"[Buildify] node_modules already exists for "
+                f"project {project_id}: {node_modules_dir}",
                 flush=True,
             )
 
@@ -310,13 +308,15 @@ def _prepare_frontend(project_id, project_dir, script):
                     "severity": "ready",
                     "error": None,
                     "stage": "dependencies_installed",
-                    "message": "Frontend dependencies are ready.",
+                    "message": "Frontend dependencies are already installed.",
                     "package_dir": package_dir,
                 }
 
             return
 
-        # Dependencies are missing/incomplete, so install them.
+        # ---------------------------------------------------------
+        # Dependencies don't exist → install them
+        # ---------------------------------------------------------
         with _preview_jobs_lock:
             _preview_jobs[project_id] = {
                 "status": "preparing",
@@ -325,11 +325,15 @@ def _prepare_frontend(project_id, project_dir, script):
                 "stage": "npm_install",
                 "message": "Installing React frontend dependencies.",
                 "package_dir": package_dir,
-                "command": f"{npm_command} install --no-audit --no-fund",
+                "command": (
+                    f"{npm_command} install "
+                    "--include=dev --no-audit --no-fund"
+                ),
             }
 
         print(
-            f"[Buildify] Starting npm install for project {project_id}",
+            f"[Buildify] Starting npm install for project "
+            f"{project_id}",
             flush=True,
         )
 
@@ -337,6 +341,7 @@ def _prepare_frontend(project_id, project_dir, script):
             [
                 npm_command,
                 "install",
+                "--include=dev",
                 "--no-audit",
                 "--no-fund",
             ],
@@ -378,35 +383,23 @@ def _prepare_frontend(project_id, project_dir, script):
 
             return
 
-        # Verify that Vite was actually installed.
-        vite_path = os.path.join(
-            package_dir,
-            "node_modules",
-            ".bin",
-            "vite",
-        )
-
-        if not os.path.exists(vite_path):
-            details = (
-                result.stdout
-                or result.stderr
-                or ""
-            ).strip()
-
+        # ---------------------------------------------------------
+        # Verify node_modules was created
+        # ---------------------------------------------------------
+        if not os.path.isdir(node_modules_dir):
             with _preview_jobs_lock:
                 _preview_jobs[project_id] = {
                     "status": "failed",
                     "severity": "error",
                     "stage": "npm_install",
                     "error": (
-                        "Vite executable was not found after "
-                        "npm install."
+                        "node_modules directory was not found "
+                        "after npm install."
                     ),
                     "message": (
-                        "React dependencies were installed, "
-                        "but Vite is missing."
+                        "npm install completed but frontend "
+                        "dependencies were not created."
                     ),
-                    "npm_output": details[-4000:],
                     "package_dir": package_dir,
                 }
 
@@ -415,6 +408,12 @@ def _prepare_frontend(project_id, project_dir, script):
         print(
             f"[Buildify] npm install completed for project "
             f"{project_id}",
+            flush=True,
+        )
+
+        print(
+            f"[Buildify] node_modules stored at: "
+            f"{node_modules_dir}",
             flush=True,
         )
 

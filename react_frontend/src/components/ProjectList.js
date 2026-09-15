@@ -335,6 +335,15 @@ const ProjectList = () => {
     } catch {}
   };
 
+  const handleCloseFile = () => {
+    setSelectedFile(null);
+    setFileContent("");
+    setEditorContent("");
+    setFileTab("view");
+    setModifyHistory([]);
+    setModifyPrompt("");
+  };
+
   const handleSaveFile = async () => {
     if (!selectedFile) return;
     try {
@@ -749,7 +758,10 @@ const ProjectList = () => {
                               <button onClick={handleSaveFile} className="btn btn-primary btn-sm" style={{ margin: "4px 8px 4px 0", padding: "4px 12px", fontSize: 11 }}>💾 Save</button>
                             )}
                           </div>
-                          <div className="code-header">📄 {selectedFile}</div>
+                          <div className="code-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                            <span>📄 {selectedFile}</span>
+                            <button onClick={handleCloseFile} className="btn btn-sm" aria-label={`Close ${selectedFile}`} title="Close file" style={{ padding: "2px 8px", fontSize: 16, lineHeight: 1 }}>×</button>
+                          </div>
                           {fileTab === "view" && <pre className="code-content">{fileContent}</pre>}
                           {fileTab === "edit" && (
                             <div style={{ maxHeight: 500, overflow: "auto" }}>
