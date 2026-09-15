@@ -1450,6 +1450,15 @@ def project_chat(request, project_id):
             },
             status=error.status_code if isinstance(error.status_code, int) and 400 <= error.status_code <= 599 else status.HTTP_502_BAD_GATEWAY,
         )
+    except Exception as error:
+        return Response(
+            {
+                "error": "Project modification failed",
+                "detail": str(error),
+                "code": "project_chat_error",
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
     if not result:
         return Response({"error": "Project chat failed"}, status=status.HTTP_502_BAD_GATEWAY)
 

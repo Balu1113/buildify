@@ -234,7 +234,7 @@ const ProjectList = () => {
   const fetchProjects = async () => { try { const r = await projectAPI.list(); setProjects(r.data); } catch {} };
   const fetchTasks = async (pid) => { try { const r = await taskAPI.list({ project_id: pid }); setTasks(r.data); } catch {} };
   const fetchPipeline = async (pid) => { try { const r = await pipelineAPI.getByProject(pid); if (r.data?.length) { setPipeline(r.data[0]); return r.data[0]; } } catch {} return null; };
-  const fetchFiles = async (pid) => { try { const r = await generatedAPI.files(`project_${pid}`); const nextFiles = r.data.files || []; setFiles(nextFiles); return nextFiles; } catch { setFiles([]); return []; } };
+  const fetchFiles = async (pid) => { try { const r = await generatedAPI.files(pid); const nextFiles = r.data.files || []; setFiles(nextFiles); return nextFiles; } catch { setFiles([]); return []; } };
 
   const startPolling = (pid) => {
     if (pollRef.current) clearInterval(pollRef.current);
@@ -330,7 +330,7 @@ const ProjectList = () => {
 
   const handleViewFile = async (path) => {
     try {
-      const r = await generatedAPI.readFile(`project_${selectedProject}`, path);
+      const r = await generatedAPI.readFile(selectedProject, path);
       setSelectedFile(path); setFileContent(r.data.content); setEditorContent(r.data.content); setFileTab("view");
     } catch {}
   };
@@ -347,7 +347,7 @@ const ProjectList = () => {
   const handleSaveFile = async () => {
     if (!selectedFile) return;
     try {
-      const r = await generatedAPI.saveFile(`project_${selectedProject}`, selectedFile, editorContent);
+      const r = await generatedAPI.saveFile(selectedProject, selectedFile, editorContent);
       setFileContent(editorContent); setFiles(r.data.files); showToast("File saved", "success");
     } catch { showToast("Failed to save file", "error"); }
   };
@@ -358,7 +358,7 @@ const ProjectList = () => {
     setModifyPrompt(""); setModifyLoading(true);
     setModifyHistory((h) => [...h, { role: "user", text: prompt }]);
     try {
-      const r = await generatedAPI.chat(`project_${selectedProject}`, prompt, modifyHistory, applyChatChanges, selectedAiModel);
+      const r = await generatedAPI.chat(selectedProject, prompt, modifyHistory, applyChatChanges, selectedAiModel);
       const data = r.data;
       const recommendations = (data.recommendations || []).map((item) => `${item.priority.toUpperCase()}: ${item.title} (${item.effort})`).join("\n");
       const changed = (data.changed_files || []).join(", ");
@@ -367,7 +367,7 @@ const ProjectList = () => {
       setFiles(r.data.files);
       if (selectedFile) {
         try {
-          const fr = await generatedAPI.readFile(`project_${selectedProject}`, selectedFile);
+          const fr = await generatedAPI.readFile(selectedProject, selectedFile);
           setFileContent(fr.data.content); setEditorContent(fr.data.content);
         } catch {}
       }
@@ -385,7 +385,7 @@ const ProjectList = () => {
     try {
       setRunState({ status: "starting", port: null });
       setPreparationStatus(null);
-      const r = await generatedAPI.run(`project_${projectId}`);
+      const r = await generatedAPI.run(projectId);
       setTerminalInfo(r.data.terminal || null);
       if (r.data.status === "running") {
         setRunState({ status: "running", port: r.data.port });
@@ -427,7 +427,7 @@ const ProjectList = () => {
 
   const handleStop = async () => {
     try {
-      await generatedAPI.stop(`project_${selectedProject}`);
+      await generatedAPI.stop(selectedProject);
       setRunState({ status: "idle", port: null });
       setTerminalInfo(null);
       setPreparationStatus(null);
@@ -441,7 +441,7 @@ const ProjectList = () => {
 
   runPollRef.current = setInterval(async () => {
     try {
-      const r = await generatedAPI.status(`project_${selectedProject}`);
+      const r = await generatedAPI.status(selectedProject);
 
       if (r.data.terminal) {
         setTerminalInfo(r.data.terminal);

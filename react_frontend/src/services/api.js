@@ -97,39 +97,44 @@ export const pipelineAPI = {
   stop: (id) => api.post(`/pipeline/${id}/stop/`),
 };
 
+const normalizeGeneratedProjectId = (projectId) => {
+  const value = String(projectId);
+  return value.startsWith("project_") ? value : `project_${value}`;
+};
+
 export const generatedAPI = {
   list: () => api.get("/ai/generated/"),
-  files: (projectId) => api.get(`/ai/generated/${projectId}/files/`),
+  files: (projectId) => api.get(`/ai/generated/${normalizeGeneratedProjectId(projectId)}/files/`),
   readFile: (projectId, filePath) =>
-    api.get(`/ai/generated/${projectId}/file/`, {
+    api.get(`/ai/generated/${normalizeGeneratedProjectId(projectId)}/file/`, {
       params: { file_path: filePath },
     }),
   modify: (projectId, modification, model) =>
-    api.post(`/ai/generated/${projectId}/modify/`, {
+    api.post(`/ai/generated/${normalizeGeneratedProjectId(projectId)}/modify/`, {
       modification,
       model,
     }),
   chat: (projectId, message, conversation = [], applyChanges = false, model) =>
-    api.post(`/ai/generated/${projectId}/chat/`, {
+    api.post(`/ai/generated/${normalizeGeneratedProjectId(projectId)}/chat/`, {
       message,
       conversation,
       apply_changes: applyChanges,
       model,
     }),
   saveFile: (projectId, filePath, content) =>
-    api.put(`/ai/generated/${projectId}/save/`, {
+    api.put(`/ai/generated/${normalizeGeneratedProjectId(projectId)}/save/`, {
       file_path: filePath,
       content,
     }),
   run: (projectId) =>
-    api.post(`/ai/generated/${projectId}/run/`),
+    api.post(`/ai/generated/${normalizeGeneratedProjectId(projectId)}/run/`),
   stop: (projectId) =>
-    api.post(`/ai/generated/${projectId}/stop/`),
+    api.post(`/ai/generated/${normalizeGeneratedProjectId(projectId)}/stop/`),
   status: (projectId) =>
-    api.get(`/ai/generated/${projectId}/status/`),
+    api.get(`/ai/generated/${normalizeGeneratedProjectId(projectId)}/status/`),
 
   previewUrl: (projectId) =>
-    `${API_BASE_URL}/ai/generated/${projectId}/preview/`,
+    `${API_BASE_URL}/ai/generated/${normalizeGeneratedProjectId(projectId)}/preview/`,
 };
 
 export const authAPI = {

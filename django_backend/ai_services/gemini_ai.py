@@ -688,10 +688,24 @@ Rules:
     
     try:
         response_text = generate_response(prompt, model_name=model_name).strip()
-        clean_json = re.sub(r"```json\s*|\s*```", "", response_text).strip()
+        clean_json = re.sub(r"```(?:json)?\s*|\s*```", "", response_text, flags=re.IGNORECASE).strip()
+        if not clean_json.startswith("{"):
+            object_start = clean_json.find("{")
+            object_end = clean_json.rfind("}")
+            if object_start >= 0 and object_end > object_start:
+                clean_json = clean_json[object_start:object_end + 1]
         result = json.loads(clean_json)
         if not isinstance(result, dict):
             raise ValueError("AI chat response was not an object")
+        for field in ("files", "new_files"):
+            if field not in result or result[field] is None:
+                result[field] = {}
+            if not isinstance(result[field], dict):
+                raise ValueError(f"AI chat field '{field}' must be an object")
+        if result.get("deleted_files") is None:
+            result["deleted_files"] = []
+        if not isinstance(result["deleted_files"], list):
+            raise ValueError("AI chat field 'deleted_files' must be a list")
         if not apply_changes:
             result["files"] = {}
             result["new_files"] = {}
