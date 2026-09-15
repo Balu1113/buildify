@@ -1175,7 +1175,7 @@ def run_status(request, project_id):
 def preview_project(request, project_id, preview_path=""):
     """
     Proxy requests from the Buildify browser to the generated
-    project's running frontend process.
+    project's frontend or backend process.
     """
 
     project, project_dir = _project_workspace(
@@ -1200,27 +1200,8 @@ def preview_project(request, project_id, preview_path=""):
             status=status.HTTP_409_CONFLICT,
         )
 
-    frontend_process = None
-
-    for info in process_info["processes"]:
-        if info["script"].endswith("package.json"):
-            frontend_process = info
-            break
-
-    if frontend_process is None:
-        return Response(
-            {
-                "error": "Frontend preview process is not running",
-            },
-            status=status.HTTP_409_CONFLICT,
-        )
-
-    frontend_port = frontend_process["port"]
-
-    preview_path = preview_path.lstrip("/")
-
-        # ---------------------------------------------------------
-    # Select generated backend or frontend process
+    # ---------------------------------------------------------
+    # Find generated backend and frontend processes
     # ---------------------------------------------------------
     backend_process = None
     frontend_process = None
@@ -1232,7 +1213,14 @@ def preview_project(request, project_id, preview_path=""):
         elif info["script"].endswith("package.json"):
             frontend_process = info
 
-    # API requests go to the generated Django backend.
+    # ---------------------------------------------------------
+    # Clean preview path
+    # ---------------------------------------------------------
+    preview_path = preview_path.lstrip("/")
+
+    # ---------------------------------------------------------
+    # Determine whether request belongs to backend or frontend
+    # ---------------------------------------------------------
     is_backend_request = (
         preview_path == "api"
         or preview_path.startswith("api/")
@@ -1257,9 +1245,6 @@ def preview_project(request, project_id, preview_path=""):
 
     target_port = target_process["port"]
 
-    if not preview_path:
-        preview_path = "static/"
-
     # ---------------------------------------------------------
     # Build target URL
     # ---------------------------------------------------------
@@ -1271,6 +1256,9 @@ def preview_project(request, project_id, preview_path=""):
     if request.META.get("QUERY_STRING"):
         target_url += f"?{request.META['QUERY_STRING']}"
 
+    # ---------------------------------------------------------
+    # Forward required headers
+    # ---------------------------------------------------------
     headers = {}
 
     for header_name in (
@@ -1286,10 +1274,11 @@ def preview_project(request, project_id, preview_path=""):
         if value:
             headers[header_name] = value
 
-    body = request.body if request.method not in {
-        "GET",
-        "HEAD",
-    } else None
+    body = (
+        request.body
+        if request.method not in {"GET", "HEAD"}
+        else None
+    )
 
     proxy_request = Request(
         target_url,
@@ -1298,6 +1287,9 @@ def preview_project(request, project_id, preview_path=""):
         method=request.method,
     )
 
+    # ---------------------------------------------------------
+    # Forward request to generated process
+    # ---------------------------------------------------------
     try:
         with urlopen(
             proxy_request,
@@ -1349,7 +1341,7 @@ def preview_project(request, project_id, preview_path=""):
             {
                 "error": "Unable to connect to preview process",
                 "detail": str(error.reason),
-                "port": frontend_port,
+                "port": target_port,
             },
             status=status.HTTP_502_BAD_GATEWAY,
         )

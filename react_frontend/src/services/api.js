@@ -101,9 +101,14 @@ export const generatedAPI = {
   list: () => api.get("/ai/generated/"),
   files: (projectId) => api.get(`/ai/generated/${projectId}/files/`),
   readFile: (projectId, filePath) =>
-    api.get(`/ai/generated/${projectId}/file/`, { params: { file_path: filePath } }),
+    api.get(`/ai/generated/${projectId}/file/`, {
+      params: { file_path: filePath },
+    }),
   modify: (projectId, modification, model) =>
-    api.post(`/ai/generated/${projectId}/modify/`, { modification, model }),
+    api.post(`/ai/generated/${projectId}/modify/`, {
+      modification,
+      model,
+    }),
   chat: (projectId, message, conversation = [], applyChanges = false, model) =>
     api.post(`/ai/generated/${projectId}/chat/`, {
       message,
@@ -112,10 +117,19 @@ export const generatedAPI = {
       model,
     }),
   saveFile: (projectId, filePath, content) =>
-    api.put(`/ai/generated/${projectId}/save/`, { file_path: filePath, content }),
-  run: (projectId) => api.post(`/ai/generated/${projectId}/run/`),
-  stop: (projectId) => api.post(`/ai/generated/${projectId}/stop/`),
-  status: (projectId) => api.get(`/ai/generated/${projectId}/status/`),
+    api.put(`/ai/generated/${projectId}/save/`, {
+      file_path: filePath,
+      content,
+    }),
+  run: (projectId) =>
+    api.post(`/ai/generated/${projectId}/run/`),
+  stop: (projectId) =>
+    api.post(`/ai/generated/${projectId}/stop/`),
+  status: (projectId) =>
+    api.get(`/ai/generated/${projectId}/status/`),
+
+  previewUrl: (projectId) =>
+    `${API_BASE_URL}/ai/generated/${projectId}/preview/`,
 };
 
 export const authAPI = {

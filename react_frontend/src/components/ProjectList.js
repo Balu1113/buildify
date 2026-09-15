@@ -731,14 +731,59 @@ const ProjectList = () => {
                   </>
                 )}
                 {runState.status === "running" && runState.port && (
-                  <div style={{ marginBottom: 16, borderRadius: 12, overflow: "hidden", border: "1px solid var(--border)" }}>
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 12px", background: "var(--bg-tertiary)", borderBottom: "1px solid var(--border)" }}>
-                      <span style={{ fontSize: 11, color: "var(--text-muted)" }}>🌐 Preview — localhost:{runState.port}</span>
-                      <a href={`http://localhost:${runState.port}`} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--accent)", textDecoration: "none" }}>↗ Open in new tab</a>
-                    </div>
-                    <iframe  src={`${API_BASE_URL}/generated/${projectId}/preview/`} title="Project Preview" style={{ width: "100%", height: 400, border: "none", background: "#fff" }} />
-                  </div>
-                )}
+  <div
+    style={{
+      marginBottom: 16,
+      borderRadius: 12,
+      overflow: "hidden",
+      border: "1px solid var(--border)",
+    }}
+  >
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        padding: "6px 12px",
+        background: "var(--bg-tertiary)",
+        borderBottom: "1px solid var(--border)",
+      }}
+    >
+      <span
+        style={{
+          fontSize: 11,
+          color: "var(--text-muted)",
+        }}
+      >
+        🌐 Preview
+      </span>
+
+      <a
+        href={generatedAPI.previewUrl(selectedProject)}
+        target="_blank"
+        rel="noreferrer"
+        style={{
+          fontSize: 11,
+          color: "var(--accent)",
+          textDecoration: "none",
+        }}
+      >
+        ↗ Open in new tab
+      </a>
+    </div>
+
+    <iframe
+      src={generatedAPI.previewUrl(selectedProject)}
+      title="Project Preview"
+      style={{
+        width: "100%",
+        height: 400,
+        border: "none",
+        background: "#fff",
+      }}
+    />
+  </div>
+)}
                 {files.length > 0 ? (
                   <div style={{ minWidth: 0, display: "grid", gridTemplateColumns: "minmax(0, 260px) minmax(0, 1fr)", gap: 12 }}>
                     <div style={{ maxHeight: 400, overflowY: "auto", background: "var(--bg-tertiary)", borderRadius: 12, padding: 6 }}>
