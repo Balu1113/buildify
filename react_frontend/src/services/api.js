@@ -1,7 +1,7 @@
 import axios from "axios";
 
 const API_BASE_URL =
-  process.env.REACT_APP_API_BASE_URL || "http://localhost:8000/api";
+  process.env.REACT_APP_API_BASE_URL || "/api";
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -133,8 +133,10 @@ export const generatedAPI = {
   status: (projectId) =>
     api.get(`/ai/generated/${normalizeGeneratedProjectId(projectId)}/status/`),
 
-  previewUrl: (projectId) =>
-    `${API_BASE_URL}/ai/generated/${normalizeGeneratedProjectId(projectId)}/preview/`,
+  previewUrl: (projectId, previewToken) => {
+    const url = `${API_BASE_URL}/ai/generated/${normalizeGeneratedProjectId(projectId)}/preview/`;
+    return previewToken ? `${url}?preview_token=${encodeURIComponent(previewToken)}` : url;
+  },
 };
 
 export const authAPI = {

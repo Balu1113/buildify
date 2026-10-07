@@ -1,3 +1,13 @@
+FROM node:20-slim AS frontend-build
+
+WORKDIR /frontend
+COPY react_frontend/package*.json ./
+RUN npm ci
+COPY react_frontend/ ./
+# An empty value makes the frontend use its same-origin /api endpoint.
+ENV REACT_APP_API_BASE_URL=
+RUN npm run build
+
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -35,7 +45,7 @@ RUN node --version && npm --version
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+COPY django_backend/requirements.txt /app/requirements.txt
 
 RUN python -m pip install --upgrade pip
 
@@ -46,6 +56,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # ---------------------------------------------------------
 
 COPY . /app
+COPY --from=frontend-build /frontend/build /app/django_backend/frontend_build
 
 # Django project directory
 WORKDIR /app/django_backend
@@ -66,4 +77,4 @@ RUN python manage.py collectstatic --noinput
 EXPOSE 8000
 RUN python manage.py collectstatic --noinput
 
-CMD ["sh", "-c", "node --version && npm --version && python manage.py migrate --noinput && gunicorn student_project_manager.wsgi:application --bind 0.0.0.0:$PORT"]
+CMD ["sh", "-c", "python manage.py migrate --noinput && gunicorn student_project_manager.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 1 --timeout 120"]

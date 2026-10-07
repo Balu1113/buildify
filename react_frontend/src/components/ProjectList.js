@@ -216,6 +216,7 @@ const ProjectList = () => {
   const [terminalInfo, setTerminalInfo] = useState(null);
   const [preparationStatus, setPreparationStatus] = useState(null);
   const [runState, setRunState] = useState({ status: "idle", port: null });
+  const [previewToken, setPreviewToken] = useState(null);
   const [editorContent, setEditorContent] = useState("");
   const [fileTab, setFileTab] = useState("view");
   const [modifyPrompt, setModifyPrompt] = useState("");
@@ -273,7 +274,7 @@ const ProjectList = () => {
   };
 
   const handleSubmit = async (e) => {
-    e.preventDefault(); setLoading(true); setToast(null); setFiles([]); setSelectedFile(null); setRunInfo(null);
+    e.preventDefault(); setLoading(true); setToast(null); setFiles([]); setSelectedFile(null); setRunInfo(null); setPreviewToken(null);
     autoRunProjectRef.current = null;
     previewSignatureRef.current = null;
     try {
@@ -309,7 +310,7 @@ const ProjectList = () => {
   };
 
   const handleSelect = async (p) => {
-    setSelectedProject(p.id); setSelectedAiModel(p.ai_model || "deepseek/deepseek-chat-v3.1"); setSelectedFile(null); setFileContent(""); setRunInfo(null); setFileTab("view"); setModifyHistory([]); setTerminalInfo(null); setPreparationStatus(null);
+    setSelectedProject(p.id); setSelectedAiModel(p.ai_model || "deepseek/deepseek-chat-v3.1"); setSelectedFile(null); setFileContent(""); setRunInfo(null); setFileTab("view"); setModifyHistory([]); setTerminalInfo(null); setPreparationStatus(null); setPreviewToken(null);
     autoRunProjectRef.current = null;
     previewSignatureRef.current = null;
     setRunState({ status: "idle", port: null });
@@ -393,6 +394,7 @@ const ProjectList = () => {
       const r = await generatedAPI.run(projectId);
       setTerminalInfo(r.data.terminal || null);
       if (r.data.status === "running") {
+        setPreviewToken(r.data.preview_token || null);
         setRunState({ status: "running", port: r.data.port });
         setPreparationStatus(null);
         if (!automatic) showToast(`App running on port ${r.data.port}`, "success");
@@ -491,6 +493,7 @@ const ProjectList = () => {
           }
 
           if (runResponse.data.status === "running") {
+            setPreviewToken(runResponse.data.preview_token || null);
             setPreparationStatus(null);
 
             setRunState({
@@ -764,7 +767,7 @@ const ProjectList = () => {
       </span>
 
       <a
-        href={generatedAPI.previewUrl(selectedProject)}
+        href={generatedAPI.previewUrl(selectedProject, previewToken)}
         target="_blank"
         rel="noreferrer"
         style={{
@@ -778,7 +781,7 @@ const ProjectList = () => {
     </div>
 
     <iframe
-      src={generatedAPI.previewUrl(selectedProject)}
+      src={generatedAPI.previewUrl(selectedProject, previewToken)}
       title="Project Preview"
       style={{
         width: "100%",

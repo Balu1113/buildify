@@ -9,7 +9,10 @@ import time
 import shutil
 
 from django.conf import settings
+from django.core import signing
 from rest_framework.decorators import api_view
+from rest_framework.decorators import permission_classes
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework import status
 
@@ -38,6 +41,9 @@ _running_processes = {}
 _preview_jobs = {}
 _preview_jobs_lock = threading.Lock()
 
+PREVIEW_TOKEN_SALT = "buildify.generated-preview"
+PREVIEW_TOKEN_MAX_AGE = 60 * 60
+
 
 def _resolve_project(project_id):
     value = str(project_id)
@@ -46,6 +52,74 @@ def _resolve_project(project_id):
     if not value.isdigit():
         return None
     return Project.objects.filter(pk=int(value)).first()
+
+
+def _preview_cookie_name(project_id):
+    return f"buildify_preview_{project_id}"
+
+
+def _issue_preview_token(request, project):
+    """Create a short-lived, project-scoped token for an iframe preview."""
+    return signing.dumps(
+        {"project_id": project.pk, "user_id": request.user.pk},
+        salt=PREVIEW_TOKEN_SALT,
+    )
+
+
+def _has_preview_access(request, project):
+    token = request.GET.get("preview_token") or request.COOKIES.get(
+        _preview_cookie_name(project.pk)
+    )
+    if not token:
+        return False
+    try:
+        payload = signing.loads(
+            token,
+            salt=PREVIEW_TOKEN_SALT,
+            max_age=PREVIEW_TOKEN_MAX_AGE,
+        )
+    except signing.BadSignature:
+        return False
+    return payload.get("project_id") == project.pk
+
+
+def _preview_runtime_script(project_id):
+    """Route generated frontend API calls through this project's preview proxy."""
+    proxy_prefix = f"/api/ai/generated/project_{project_id}/preview"
+    return f"""<script>
+(() => {{
+  const proxyPrefix = {json.dumps(proxy_prefix)};
+  const rewrite = (value) => {{
+    if (typeof value !== "string") return value;
+    try {{
+      const url = new URL(value, window.location.origin);
+      const isLocal = url.origin === window.location.origin || /^(localhost|127\\.0\\.0\\.1)$/.test(url.hostname);
+      if (isLocal && (url.pathname === "/api" || url.pathname.startsWith("/api/"))) {{
+        return proxyPrefix + url.pathname + url.search + url.hash;
+      }}
+    }} catch (_) {{}}
+    return value;
+  }};
+  const originalFetch = window.fetch;
+  if (originalFetch) window.fetch = (input, init) => originalFetch(rewrite(input), init);
+  const originalOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {{
+    return originalOpen.call(this, method, rewrite(url), ...rest);
+  }};
+}})();</script>"""
+
+
+def _inject_preview_runtime(response_body, content_type, project_id):
+    if "text/html" not in content_type.lower():
+        return response_body
+    try:
+        page = response_body.decode("utf-8")
+    except UnicodeDecodeError:
+        return response_body
+    script = _preview_runtime_script(project_id)
+    if "</head>" in page.lower():
+        return re.sub(r"</head>", f"{script}</head>", page, count=1, flags=re.IGNORECASE).encode("utf-8")
+    return f"{script}{page}".encode("utf-8")
 
 
 def _project_workspace(project_id, materialize=False):
@@ -900,6 +974,7 @@ def run_project(request, project_id):
                 "status": "running",
                 "port": info["port"],
                 "pid": info["pid"],
+                "preview_token": _issue_preview_token(request, project),
                 "pids": [
                     process_info["proc"].pid
                     for process_info in info["processes"]
@@ -1039,6 +1114,7 @@ def run_project(request, project_id):
         "status": "running",
         "port": result["port"],
         "pid": result["pid"],
+        "preview_token": _issue_preview_token(request, project),
         "pids": [
             process_info["proc"].pid
             for process_info in proc_info["processes"]
@@ -1172,6 +1248,7 @@ def run_status(request, project_id):
     })
 
 @api_view(["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+@permission_classes([AllowAny])
 def preview_project(request, project_id, preview_path=""):
     """
     Proxy requests from the Buildify browser to the generated
@@ -1187,6 +1264,12 @@ def preview_project(request, project_id, preview_path=""):
         return Response(
             {"error": "Project not found"},
             status=status.HTTP_404_NOT_FOUND,
+        )
+
+    if not _has_preview_access(request, project):
+        return Response(
+            {"error": "A valid preview token is required."},
+            status=status.HTTP_403_FORBIDDEN,
         )
 
     process_info = _running_processes.get(project_id)
@@ -1296,7 +1379,11 @@ def preview_project(request, project_id, preview_path=""):
             timeout=30,
         ) as upstream:
 
-            response_body = upstream.read()
+            response_body = _inject_preview_runtime(
+                upstream.read(),
+                upstream.headers.get("Content-Type", "text/plain"),
+                project.pk,
+            )
 
             content_type = upstream.headers.get(
                 "Content-Type",
@@ -1318,6 +1405,20 @@ def preview_project(request, project_id, preview_path=""):
 
                 if value:
                     response[header_name] = value
+
+            # The token in the initial iframe URL is exchanged for a scoped
+            # cookie so generated asset and API requests remain authorized.
+            response.set_cookie(
+                _preview_cookie_name(project.pk),
+                request.GET.get("preview_token") or request.COOKIES.get(
+                    _preview_cookie_name(project.pk)
+                ),
+                max_age=PREVIEW_TOKEN_MAX_AGE,
+                httponly=True,
+                secure=not settings.DEBUG,
+                samesite="Lax",
+                path=f"/api/ai/generated/project_{project.pk}/preview/",
+            )
 
             return response
 

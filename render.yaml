@@ -1,15 +1,26 @@
 services:
   - type: web
-    runtime: static
-    name: buildify-frontend
+    runtime: docker
+    name: buildify
+    rootDir: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: buildify-db
+          property: connectionString
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "False"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
 
-    rootDir: react_frontend
-
-    buildCommand: npm ci && npm run build
-
-    staticPublishPath: build
-
-    routes:
-      - type: rewrite
-        source: /*
-        destination: /index.html
+databases:
+  - name: buildify-db
+    plan: free

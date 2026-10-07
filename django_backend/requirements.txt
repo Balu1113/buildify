@@ -1,6 +1,12 @@
 Django>=4.2
 djangorestframework
 django-cors-headers
+dj-database-url
+gunicorn
+google-genai
+psycopg2-binary
+python-dotenv
+whitenoise
 pytest
 pytest-django
 openai
