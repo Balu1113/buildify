@@ -618,6 +618,7 @@ failure, return no file changes and explain why."""
         _set_auto_repair_job(
             project_id,
             status="ready",
+            stage="auto_repair",
             message="Auto-repair applied. Restarting the generated project...",
             changed_files=changed_files,
             summary=result.get("summary", "Applied an automatic runtime repair."),
@@ -626,6 +627,7 @@ failure, return no file changes and explain why."""
         _set_auto_repair_job(
             project_id,
             status="failed",
+            stage="auto_repair",
             message="Auto-repair could not resolve the runtime error.",
             error=str(error),
         )
@@ -645,15 +647,18 @@ def _start_auto_repair(project_id, project_dir, output):
         if fingerprint in attempted:
             return {
                 "status": "failed",
+                "stage": "auto_repair",
                 "message": "Auto-repair already attempted this runtime error.",
                 "error": "Repeated runtime error after an automatic repair.",
+                "output": output,
             }
         attempted.add(fingerprint)
 
     job = _set_auto_repair_job(
         project_id,
         status="repairing",
-        message="Runtime error detected. Auto-repair agent is analyzing it...",
+        stage="auto_repair",
+        message="Runtime error detected. Auto Bug Detection & Fix agent is analyzing it...",
         fingerprint=fingerprint,
         output=output,
         changed_files=[],
@@ -1348,14 +1353,17 @@ def run_status(request, project_id):
     repair_job = _get_auto_repair_job(project_id)
     if repair_job:
         if repair_job.get("status") == "repairing":
-            return Response(repair_job)
+            return Response({
+                **repair_job,
+                "output": repair_job.get("output", ""),
+            })
         if repair_job.get("status") == "failed":
             return Response(repair_job)
         if repair_job.get("status") == "ready":
-            # The repaired files are persisted and materialized. Let the
-            # normal start path take over, but do not retry this same error.
+            ready_snapshot = dict(repair_job)
             with _auto_repair_jobs_lock:
                 _auto_repair_jobs.pop(project_id, None)
+            return Response(ready_snapshot)
 
     filesystem_job = _read_preview_state(
         project_dir

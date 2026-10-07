@@ -410,8 +410,12 @@ const ProjectList = () => {
       }
       if (r.data.status === "repairing") {
         setRunState({ status: "starting", port: null });
-        setPreparationStatus(r.data);
-        if (!automatic) showToast(r.data.message || "Runtime error detected. Auto-repair is running...", "info");
+        // Pass the full repair job as preparationStatus so Terminal can display crash output
+        setPreparationStatus({
+          ...r.data,
+          stage: r.data.stage || "auto_repair",
+        });
+        if (!automatic) showToast(r.data.message || "🔍 Runtime error detected — Auto Bug Detection & Fix is running...", "info");
         startRunPolling();
         return false;
       }
@@ -461,8 +465,25 @@ const ProjectList = () => {
         setTerminalInfo(r.data.terminal);
       }
 
+      // Bug detection & auto-repair in progress
+      if (r.data.status === "repairing") {
+        setPreparationStatus({
+          ...r.data,
+          stage: r.data.stage || "auto_repair",
+        });
+        setRunState({ status: "starting", port: null });
+        return;
+      }
+
+      // Auto-repair applied — show success banner before restart
+      if (r.data.status === "ready" && r.data.stage === "auto_repair") {
+        setPreparationStatus(r.data);
+        setRunState({ status: "starting", port: null });
+        return;
+      }
+
       // Frontend dependencies are still being installed
-      if (r.data.status === "preparing" || r.data.status === "repairing") {
+      if (r.data.status === "preparing") {
         setPreparationStatus(r.data);
         setRunState({
           status: "starting",
