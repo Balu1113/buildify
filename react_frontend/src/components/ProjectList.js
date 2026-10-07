@@ -408,6 +408,13 @@ const ProjectList = () => {
         startRunPolling();
         return false;
       }
+      if (r.data.status === "repairing") {
+        setRunState({ status: "starting", port: null });
+        setPreparationStatus(r.data);
+        if (!automatic) showToast(r.data.message || "Runtime error detected. Auto-repair is running...", "info");
+        startRunPolling();
+        return false;
+      }
       if (r.data.status === "environment-unavailable") {
         setRunState({ status: "idle", port: null });
         setPreparationStatus(null);
@@ -455,7 +462,7 @@ const ProjectList = () => {
       }
 
       // Frontend dependencies are still being installed
-      if (r.data.status === "preparing") {
+      if (r.data.status === "preparing" || r.data.status === "repairing") {
         setPreparationStatus(r.data);
         setRunState({
           status: "starting",
