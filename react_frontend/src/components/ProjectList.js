@@ -475,10 +475,26 @@ const ProjectList = () => {
         return;
       }
 
-      // Auto-repair applied — show success banner before restart
+      // Auto-repair applied — show success banner and auto-restart project
       if (r.data.status === "ready" && r.data.stage === "auto_repair") {
         setPreparationStatus(r.data);
         setRunState({ status: "starting", port: null });
+        showToast("✓ Auto-repair applied! Restarting application...", "success");
+        clearInterval(runPollRef.current);
+        runPollRef.current = null;
+        setTimeout(() => {
+          handleRunForProject(selectedProject, true);
+        }, 1500);
+        return;
+      }
+
+      // Auto-repair failed
+      if (r.data.status === "failed" && r.data.stage === "auto_repair") {
+        setPreparationStatus(r.data);
+        setRunState({ status: "idle", port: null });
+        showToast(r.data.message || "Auto-repair could not resolve the runtime error", "error");
+        clearInterval(runPollRef.current);
+        runPollRef.current = null;
         return;
       }
 
