@@ -66,9 +66,14 @@ const Terminal = ({ terminalInfo, preparationStatus }) => {
 
             {/* Message */}
             <div style={{ padding: "10px 14px", background: "var(--bg-primary)", borderBottom: "1px solid var(--border)" }}>
-              <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: repairReady && preparationStatus?.changed_files?.length ? 8 : 0 }}>
+              <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: (preparationStatus?.summary || (repairReady && preparationStatus?.changed_files?.length)) ? 6 : 0 }}>
                 {preparationStatus?.message}
               </div>
+              {preparationStatus?.summary && (
+                <div style={{ fontSize: 11, color: "var(--accent, #6366f1)", marginBottom: 6, fontWeight: 500 }}>
+                  💡 {preparationStatus.summary}
+                </div>
+              )}
               {repairReady && preparationStatus?.changed_files?.length > 0 && (
                 <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
                   <strong style={{ color: "var(--success)" }}>Files patched:</strong>{" "}
