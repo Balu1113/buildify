@@ -1,21 +1,30 @@
 import React, { useState, useEffect } from "react";
-import { taskAPI } from "../services/api";
+import { projectAPI, taskAPI } from "../services/api";
 
 const TaskList = () => {
   const [tasks, setTasks] = useState([]);
-  const [formData, setFormData] = useState({ title: "", description: "", priority: "medium", status: "todo" });
+  const [projects, setProjects] = useState([]);
+  const [formData, setFormData] = useState({ title: "", description: "", priority: "medium", status: "todo", project: "" });
   const [filters, setFilters] = useState({ status: "", priority: "" });
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState(null);
 
   useEffect(() => { fetchTasks(); }, [filters]);
+  useEffect(() => { fetchProjects(); }, []);
 
   const fetchTasks = async () => { try { const p = {}; if (filters.status) p.status = filters.status; if (filters.priority) p.priority = filters.priority; const r = await taskAPI.list(p); setTasks(r.data); } catch {} };
+  const fetchProjects = async () => { try { const r = await projectAPI.list(); setProjects(r.data); } catch {} };
   const showToast = (msg, type = "info") => { setToast({ msg, type }); setTimeout(() => setToast(null), 4000); };
 
   const handleSubmit = async (e) => {
     e.preventDefault(); setLoading(true);
-    try { const r = await taskAPI.create(formData); showToast(`Task created! AI priority: ${r.data.priority}`, "success"); setFormData({ title: "", description: "", priority: "medium", status: "todo" }); fetchTasks(); }
+    try {
+      const payload = { ...formData, project: formData.project || null };
+      const r = await taskAPI.create(payload);
+      showToast(`Task created! AI priority: ${r.data.priority}`, "success");
+      setFormData({ title: "", description: "", priority: "medium", status: "todo", project: "" });
+      fetchTasks();
+    }
     catch { showToast("Error.", "error"); } setLoading(false);
   };
 
@@ -41,6 +50,7 @@ const TaskList = () => {
           <div className="grid-2">
             <div className="form-group"><label className="form-label">Title</label><input className="input" name="title" placeholder="Fix auth bug" value={formData.title} onChange={(e) => setFormData({ ...formData, title: e.target.value })} required /></div>
             <div className="form-group"><label className="form-label">Description</label><textarea className="textarea" name="description" placeholder="Details..." value={formData.description} onChange={(e) => setFormData({ ...formData, description: e.target.value })} rows={1} /></div>
+            <div className="form-group"><label className="form-label">Project</label><select className="select" name="project" value={formData.project} onChange={(e) => setFormData({ ...formData, project: e.target.value })}><option value="">No project</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div>
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <select className="select" name="priority" value={formData.priority} onChange={(e) => setFormData({ ...formData, priority: e.target.value })} style={{ width: 130 }}>
@@ -69,7 +79,7 @@ const TaskList = () => {
             {tasks.map(t => (
               <div key={t.id} style={{ padding: "10px 14px", borderRadius: 10, background: "var(--bg-tertiary)", display: "flex", alignItems: "center", gap: 12, opacity: t.status === "done" ? 0.5 : 1 }}>
                 <div className={`status-dot ${t.priority}`} />
-                <div style={{ flex: 1 }}><div style={{ fontSize: 13, fontWeight: 500 }}>{t.title}</div>{t.description && <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>{t.description.substring(0, 80)}</div>}</div>
+                <div style={{ flex: 1 }}><div style={{ fontSize: 13, fontWeight: 500 }}>{t.title}</div>{t.description && <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>{t.description.substring(0, 80)}</div>}{t.project && <div style={{ fontSize: 11, color: "var(--accent)", marginTop: 2 }}>Project: {projects.find((project) => project.id === t.project)?.name || `#${t.project}`}</div>}</div>
                 <select value={t.status} onChange={(e) => handleStatusChange(t.id, e.target.value)} className="select" style={{ width: 110, padding: "5px 10px", fontSize: 11 }}>
                   <option value="todo">To Do</option><option value="in_progress">Active</option><option value="done">Done</option>
                 </select>
