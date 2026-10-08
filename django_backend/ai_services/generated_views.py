@@ -2,6 +2,7 @@ import os
 import ast
 import json
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -100,6 +101,25 @@ def _has_preview_access(request, project):
     except signing.BadSignature:
         return False
     return payload.get("project_id") == project.pk
+
+
+def _attach_preview_cookie(request, response, project):
+    """Authorize subsequent preview/iframe requests via a scoped cookie.
+
+    Every successful run response refreshes the cookie with a freshly signed
+    token, so sessions stay valid past the token TTL and the iframe works
+    without appending ``preview_token`` to each URL.
+    """
+    response.set_cookie(
+        _preview_cookie_name(project.pk),
+        _issue_preview_token(request, project),
+        max_age=PREVIEW_TOKEN_MAX_AGE,
+        httponly=True,
+        secure=request.is_secure(),
+        samesite="Lax",
+        path="/",
+    )
+    return response
 
 
 def _preview_runtime_script(project_id):
@@ -976,19 +996,29 @@ def _start_process(project_id, project_dir, script):
                 python_paths
             )
 
-            proc = subprocess.Popen(
-                cmd,
-                cwd=cwd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                creationflags=getattr(
+            popen_kwargs = {
+                "cwd": cwd,
+                "env": env,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "bufsize": 1,
+                "creationflags": getattr(
                     subprocess,
                     "CREATE_NO_WINDOW",
                     0,
                 ),
+            }
+
+            if os.name == "posix":
+                # Own session/process group so stopping can terminate npm's
+                # and the dev server's grandchildren; otherwise orphaned
+                # children keep writing to the workspace during materialize.
+                popen_kwargs["start_new_session"] = True
+
+            proc = subprocess.Popen(
+                cmd,
+                **popen_kwargs,
             )
 
             output_lines = []
@@ -1028,7 +1058,7 @@ def _start_process(project_id, project_dir, script):
     except Exception as error:
         for info in processes:
             try:
-                info["proc"].terminate()
+                _terminate_process_tree(info["proc"])
             except Exception:
                 pass
 
@@ -1099,19 +1129,48 @@ def _wait_for_port(port, process, timeout=60):
     return False
 
 
+def _terminate_process_tree(proc, timeout=5):
+    """Terminate a generated process and any children in its group.
+
+    ``npm run``/``vite`` and Django's runserver reloader spawn grandchildren;
+    killing only the direct child leaves orphans that hold ports and keep
+    writing into the workspace. On POSIX the process runs in its own session
+    (see ``_start_process``), so signaling the process group reaches them.
+    """
+    if proc.poll() is not None:
+        return
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            proc.terminate()
+    else:
+        proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+    else:
+        proc.kill()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _stop_process(project_id):
     info = _running_processes.pop(project_id, None)
     if not info:
         return False
     for process_info in info["processes"]:
-        proc = process_info["proc"]
         try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            _terminate_process_tree(process_info["proc"])
         except Exception:
             pass
     return True
@@ -1191,6 +1250,15 @@ def run_project(request, project_id):
             status=status.HTTP_404_NOT_FOUND,
         )
 
+    # A fresh run supersedes any previous auto-repair outcome. Without this,
+    # run_status keeps returning the stale "failed" repair job on every poll,
+    # so the frontend would stop polling (and hide the preview) even though
+    # the newly started app is running.
+    existing_repair = _get_auto_repair_job(project_id)
+    if existing_repair and existing_repair.get("status") != "repairing":
+        with _auto_repair_jobs_lock:
+            _auto_repair_jobs.pop(project_id, None)
+
     # If this project already has a preview process, reuse it.
     if project_id in _running_processes:
         info = _running_processes[project_id]
@@ -1199,7 +1267,7 @@ def run_project(request, project_id):
             process_info["proc"].poll() is None
             for process_info in info["processes"]
         ):
-            return Response({
+            return _attach_preview_cookie(request, Response({
                 "status": "running",
                 "port": info["port"],
                 "pid": info["pid"],
@@ -1209,7 +1277,7 @@ def run_project(request, project_id):
                     for process_info in info["processes"]
                 ],
                 "message": f"Already running on port {info['port']}",
-            })
+            }), project)
 
         _running_processes.pop(project_id, None)
 
@@ -1355,7 +1423,7 @@ def run_project(request, project_id):
             status=status.HTTP_502_BAD_GATEWAY,
         )
 
-    return Response({
+    return _attach_preview_cookie(request, Response({
         "status": "running",
         "port": result["port"],
         "pid": result["pid"],
@@ -1372,7 +1440,7 @@ def run_project(request, project_id):
             project_dir,
             proc_info,
         ),
-    })
+    }), project)
 
 @api_view(["POST"])
 def stop_project(request, project_id):
@@ -1501,7 +1569,9 @@ def run_status(request, project_id):
             "exit_code": poll,
         })
 
-    return Response({
+    # Refresh the preview cookie on every running poll so an active session
+    # never hits the signed-token expiry while the app is up.
+    return _attach_preview_cookie(request, Response({
         "status": "running",
         "port": info["port"],
         "pid": info["pid"],
@@ -1517,7 +1587,7 @@ def run_status(request, project_id):
             ),
             info,
         ),
-    })
+    }), project)
 
 @api_view(["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 @permission_classes([AllowAny])
@@ -1538,21 +1608,27 @@ def preview_project(request, project_id, preview_path=""):
             status=status.HTTP_404_NOT_FOUND,
         )
 
+    process_info = _running_processes.get(project_id)
+
+    if not process_info:
+        # Report the actionable state before the auth check so a user opening
+        # preview for a project that was never successfully started sees
+        # "start it first" instead of a bare 403.
+        return Response(
+            {
+                "error": (
+                    "Preview is not running. "
+                    "Start the project from the dashboard to open its preview."
+                ),
+                "status": "not_running",
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
     if not _has_preview_access(request, project):
         return Response(
             {"error": "A valid preview token is required."},
             status=status.HTTP_403_FORBIDDEN,
-        )
-
-    process_info = _running_processes.get(project_id)
-
-    if not process_info:
-        return Response(
-            {
-                "error": "Preview is not running",
-                "status": "not_running",
-            },
-            status=status.HTTP_409_CONFLICT,
         )
 
     # ---------------------------------------------------------

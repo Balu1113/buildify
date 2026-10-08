@@ -1,13 +1,22 @@
 import hashlib
 import os
-import shutil
 
 from django.db import transaction
 
 from .models import GeneratedFile, Project
 
 
-EXCLUDED_WORKSPACE_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
+EXCLUDED_WORKSPACE_DIRS = {
+    ".git",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    # Install markers and runtime state: must survive materialize clears so
+    # dependency installs are not repeated and restart recovery keeps working.
+    ".pipeline",
+    ".buildify",
+}
 
 
 def normalize_file_path(path):
@@ -50,13 +59,43 @@ def load_project_files(project):
     }
 
 
+def _clear_workspace(directory):
+    """Delete workspace contents while preserving excluded dirs at any depth.
+
+    ``node_modules``/``.venv`` live inside subdirectories (e.g. ``frontend/``),
+    so a top-level-only exclusion would delete them on every clear — forcing a
+    full reinstall and racing with lingering dev-server children, which aborts
+    materialization with ENOTEMPTY. Recurse instead, keep excluded subtrees,
+    and tolerate concurrent writers rather than failing the whole operation.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if name in EXCLUDED_WORKSPACE_DIRS:
+            continue
+        path = os.path.join(directory, name)
+        if os.path.isdir(path) and not os.path.islink(path):
+            _clear_workspace(path)
+            try:
+                os.rmdir(path)
+            except OSError:
+                # Still holds a preserved dir (node_modules, .venv, ...) or a
+                # concurrently recreated entry; leaving it is safe because
+                # materialization rewrites every persisted file afterwards.
+                pass
+        else:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def materialize_project(project, project_dir, clear=False):
     files = load_project_files(project)
     if clear and os.path.isdir(project_dir):
-        for name in os.listdir(project_dir):
-            if name not in EXCLUDED_WORKSPACE_DIRS:
-                path = os.path.join(project_dir, name)
-                shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+        _clear_workspace(project_dir)
     os.makedirs(project_dir, exist_ok=True)
     for relative_path, content in files.items():
         full_path = os.path.join(project_dir, *relative_path.split("/"))

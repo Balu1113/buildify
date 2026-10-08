@@ -1310,6 +1310,12 @@ CRITICAL RULES:
    - django.contrib.auth.middleware.AuthenticationMiddleware
    - django.contrib.messages.middleware.MessageMiddleware
    - django.middleware.clickjacking.XFrameOptionsMiddleware
+   - Every third-party package imported by settings.py (corsheaders,
+     whitenoise, rest_framework, ...) MUST also be listed in
+     requirements.txt (corsheaders requires django-cors-headers).
+     Do not add third-party middleware beyond this list; if you do,
+     its package must be in requirements.txt or the app will crash
+     at startup with ModuleNotFoundError.
 
 7. **TEMPLATES**: Include the full TEMPLATES list with APP_DIRS=True and all context_processors.
 
@@ -2365,6 +2371,30 @@ def _validate_project_locally(project_dir):
                         text=True, timeout=180,
                     )
                     checks.append({"name": name, "passed": result.returncode == 0, "output": (result.stdout + result.stderr).strip()})
+
+                # `manage.py check` never imports MIDDLEWARE, so a settings
+                # module referencing an uninstalled package (whitenoise,
+                # corsheaders, ...) passes it and then crashes at runserver.
+                # Importing the WSGI/ASGI entrypoint runs get_wsgi_application
+                # -> load_middleware and catches that before the first Run.
+                entrypoints = []
+                for root, dirs, files in os.walk(backend_dir):
+                    dirs[:] = [name for name in dirs if name not in PROJECT_EXCLUDED_DIRS]
+                    for name in ("wsgi.py", "asgi.py"):
+                        if name in files:
+                            entrypoints.append(os.path.join(root, name))
+                for entrypoint in entrypoints[:1]:
+                    module_name = os.path.splitext(os.path.basename(entrypoint))[0]
+                    result = subprocess.run(
+                        [python, "-c", f"import {module_name}"],
+                        cwd=os.path.dirname(entrypoint), env=env,
+                        capture_output=True, text=True, timeout=180,
+                    )
+                    checks.append({
+                        "name": "Django application load",
+                        "passed": result.returncode == 0,
+                        "output": (result.stdout + result.stderr).strip(),
+                    })
         except Exception as error:
             checks.append({"name": "Django validation", "passed": False, "output": str(error)})
     else:
@@ -2463,6 +2493,7 @@ def _acceptance_findings(acceptance):
         "Generated Django project discovery": "critical",
         "Project entrypoint": "critical",
         "Backend dependency file": "major",
+        "Django application load": "critical",
         "Frontend package.json": "major",
         "Frontend structure": "major",
     }
@@ -2474,6 +2505,11 @@ def _acceptance_findings(acceptance):
         "Django migrations": "Add or repair generated app migrations and database configuration.",
         "Django migration check": "Create consistent migrations for the generated applications.",
         "Backend dependency file": "Add a complete generated backend requirements.txt.",
+        "Django application load": (
+            "List every third-party package imported by settings.py in "
+            "requirements.txt (e.g. django-cors-headers, whitenoise), or "
+            "remove that entry from settings.MIDDLEWARE/INSTALLED_APPS."
+        ),
         "Frontend package.json": "Add the generated React frontend package.json and scripts.",
         "Frontend structure": "Restore the generated frontend entrypoint and source structure.",
     }
