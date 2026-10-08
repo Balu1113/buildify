@@ -140,3 +140,13 @@ class GeneratedPreviewFlowTests(TestCase):
 
         stop = self.client.post(f"/api/ai/generated/{self.project_id}/stop/")
         self.assertEqual(stop.status_code, 200)
+
+    def test_files_endpoint_exposes_live_line_stats(self):
+        resp = self.client.get(f"/api/ai/generated/{self.project_id}/files/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        files = resp.json()["files"]
+        main_py = next(f for f in files if f["path"] == "main.py")
+        self.assertEqual(main_py["lines"], len(MAIN_PY.splitlines()))
+        self.assertEqual(main_py["added_lines"], len(MAIN_PY.splitlines()))
+        self.assertEqual(main_py["removed_lines"], 0)
+        self.assertIn("updated_at", main_py)

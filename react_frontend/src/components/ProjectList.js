@@ -126,7 +126,7 @@ const buildFileTree = (files) => {
     let current = tree;
     parts.forEach((part, i) => {
       if (i === parts.length - 1) {
-        current[part] = { _file: true, size: f.size, path: f.path };
+        current[part] = { _file: true, size: f.size, path: f.path, lines: f.lines, addedLines: f.added_lines, removedLines: f.removed_lines };
       } else {
         if (!current[part]) current[part] = {};
         current = current[part];
@@ -175,6 +175,12 @@ const FileTree = ({ tree, selectedFile, onSelect, depth = 0 }) => {
             <div key={item.path} onClick={() => onSelect(item.path)} className={`file-item ${selectedFile === item.path ? "active" : ""}`} style={{ paddingLeft: 8 + depth * 16 }}>
               <span className="file-icon">{FILE_ICONS[ext] || "📄"}</span>
               <span style={{ flex: 1, fontSize: 12 }}>{name}</span>
+              {item.addedLines > 0 && (
+                <span style={{ fontSize: 10, fontWeight: 700, color: "var(--success)" }}>+{item.addedLines}</span>
+              )}
+              {item.removedLines > 0 && (
+                <span style={{ fontSize: 10, fontWeight: 700, color: "var(--danger)" }}>−{item.removedLines}</span>
+              )}
               <span className="file-size">{item.size > 1024 ? `${(item.size / 1024).toFixed(1)}k` : `${item.size}B`}</span>
             </div>
           );
@@ -769,7 +775,7 @@ const ProjectList = () => {
             {pipeline && (isComplete || files.length > 0 || loading) && (
               <div className="card" style={{ minWidth: 0, borderColor: "var(--success)" }}>
                 <div className="card-header">
-                  <div><div className="card-title" style={{ color: "var(--success)" }}>✨ Generated Project</div><div className="card-subtitle">{files.length ? `${files.length} files written live` : "Agents are creating files..."}</div></div>
+                  <div><div className="card-title" style={{ color: "var(--success)" }}>✨ Generated Project</div><div className="card-subtitle">{files.length ? `${files.length} files written live · +${files.reduce((n, f) => n + (f.added_lines || 0), 0)} lines added` : "Agents are creating files..."}</div></div>
                   <div style={{ display: "flex", gap: 8 }}>
                     {isComplete && runState.status === "running" ? (
                       <button onClick={handleStop} className="btn btn-danger">⏹ Stop</button>
@@ -780,6 +786,24 @@ const ProjectList = () => {
                     ) : null}
                   </div>
                 </div>
+                {files.length > 0 && (
+                  <div style={{ marginBottom: 12, background: "var(--bg-tertiary)", borderRadius: 12, padding: "8px 12px", maxHeight: 160, overflowY: "auto", display: "grid", gap: 4 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)" }}>
+                      {pipeline.stage !== "completed" && pipeline.stage !== "failed" ? "✍️ Writing files live" : "🕘 Recent file changes"}
+                    </div>
+                    {[...files]
+                      .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+                      .slice(0, 10)
+                      .map((f) => (
+                        <div key={f.path} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, fontFamily: "monospace", minWidth: 0 }}>
+                          <span style={{ flex: 1, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.path}</span>
+                          {f.added_lines > 0 && <span style={{ fontWeight: 700, color: "var(--success)" }}>+{f.added_lines}</span>}
+                          {f.removed_lines > 0 && <span style={{ fontWeight: 700, color: "var(--danger)" }}>−{f.removed_lines}</span>}
+                          <span style={{ color: "var(--text-muted)" }}>{f.lines ?? 0}L</span>
+                        </div>
+                      ))}
+                  </div>
+                )}
                 {(runState.status === "running" || runState.status === "starting") && (
                   <>
                     <Terminal terminalInfo={terminalInfo} preparationStatus={preparationStatus} />

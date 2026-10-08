@@ -61,6 +61,11 @@ class GeneratedFile(models.Model):
     path = models.CharField(max_length=1024)
     content = models.TextField()
     content_hash = models.CharField(max_length=64, blank=True, default="")
+    line_count = models.IntegerField(default=0)
+    # Diff of the most recent write against the previous content, so the
+    # frontend can show "+N lines" live while the pipeline writes files.
+    added_lines = models.IntegerField(default=0)
+    removed_lines = models.IntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

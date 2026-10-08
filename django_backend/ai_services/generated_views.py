@@ -1978,10 +1978,13 @@ def _serialized_project_files(project):
         {
             "path": item.path,
             "size": len(item.content.encode("utf-8")),
+            "lines": item.line_count,
+            "added_lines": item.added_lines,
+            "removed_lines": item.removed_lines,
             "updated_at": item.updated_at.isoformat(),
         }
         for item in GeneratedFile.objects.filter(project=project).only(
-            "path", "content", "updated_at"
+            "path", "content", "updated_at", "line_count", "added_lines", "removed_lines"
         )
     ]
 

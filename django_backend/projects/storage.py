@@ -1,3 +1,4 @@
+import difflib
 import hashlib
 import os
 
@@ -33,16 +34,45 @@ def project_id_from_workspace(project_dir):
     return int(name.removeprefix("project_"))
 
 
+def line_stats(previous_content, content):
+    """Return (line_count, added_lines, removed_lines) for a write.
+
+    ``previous_content`` is None for a brand-new file: every line counts as
+    added. Unchanged rewrites report a zero diff.
+    """
+    new_lines = content.splitlines()
+    if previous_content is None:
+        return len(new_lines), len(new_lines), 0
+    old_lines = previous_content.splitlines()
+    added = removed = 0
+    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("replace", "delete"):
+            removed += i2 - i1
+        if tag in ("replace", "insert"):
+            added += j2 - j1
+    return len(new_lines), added, removed
+
+
 @transaction.atomic
 def save_generated_file(project, path, content):
     path = normalize_file_path(path)
     content = str(content)
+    previous = (
+        GeneratedFile.objects.filter(project=project, path=path)
+        .values_list("content", flat=True)
+        .first()
+    )
+    line_count, added_lines, removed_lines = line_stats(previous, content)
     GeneratedFile.objects.update_or_create(
         project=project,
         path=path,
         defaults={
             "content": content,
             "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "line_count": line_count,
+            "added_lines": added_lines,
+            "removed_lines": removed_lines,
         },
     )
     return path

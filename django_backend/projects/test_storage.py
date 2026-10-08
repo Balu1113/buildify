@@ -5,7 +5,7 @@ import tempfile
 from django.test import TestCase
 
 from projects.models import Project
-from projects.storage import materialize_project, persist_workspace, save_generated_file
+from projects.storage import line_stats, materialize_project, persist_workspace, save_generated_file
 
 
 class MaterializeWorkspaceTests(TestCase):
@@ -75,3 +75,38 @@ class MaterializeWorkspaceTests(TestCase):
         self.assertIn("main.py", persisted)
         self.assertNotIn(".pipeline/requirements/abc.sha256", persisted)
         self.assertNotIn(".buildify/frontend_status.json", persisted)
+
+
+class LineStatsTests(TestCase):
+    def setUp(self):
+        self.project = Project.objects.create(name="Line Stats")
+
+    def _stats(self, path):
+        from projects.models import GeneratedFile
+
+        return GeneratedFile.objects.get(project=self.project, path=path)
+
+    def test_new_file_counts_every_line_as_added(self):
+        save_generated_file(self.project, "app.py", "a\nb\nc")
+        row = self._stats("app.py")
+        self.assertEqual((row.line_count, row.added_lines, row.removed_lines), (3, 3, 0))
+
+    def test_update_reports_line_delta_against_previous_content(self):
+        save_generated_file(self.project, "app.py", "a\nb\nc")
+        save_generated_file(self.project, "app.py", "a\nb\nc\nd")
+        row = self._stats("app.py")
+        self.assertEqual((row.line_count, row.added_lines, row.removed_lines), (4, 1, 0))
+
+        save_generated_file(self.project, "app.py", "a\nX\nd")
+        row = self._stats("app.py")
+        self.assertEqual((row.line_count, row.added_lines, row.removed_lines), (3, 1, 2))
+
+    def test_unchanged_rewrite_reports_zero_diff(self):
+        save_generated_file(self.project, "app.py", "a\nb")
+        save_generated_file(self.project, "app.py", "a\nb")
+        row = self._stats("app.py")
+        self.assertEqual((row.line_count, row.added_lines, row.removed_lines), (2, 0, 0))
+
+    def test_line_stats_handles_edge_inputs(self):
+        self.assertEqual(line_stats(None, ""), (0, 0, 0))
+        self.assertEqual(line_stats("one\ntwo", "one\ntwo\nthree"), (3, 1, 0))
