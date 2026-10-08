@@ -1,7 +1,7 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from .models import Task
+from .models import Task, Status
 from .serializers import TaskSerializer
 
 
@@ -32,7 +32,27 @@ class TaskViewSet(viewsets.ModelViewSet):
         if not request.data.get("priority"):
             self._auto_suggest_priority(task)
 
+        self._auto_run_pipeline(task.project_id, task.status)
+
         return Response(TaskSerializer(task).data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        previous_project_id = self.get_object().project_id
+        response = super().update(request, *args, **kwargs)
+        data = response.data
+        if previous_project_id != data["project"]:
+            self._auto_run_pipeline(data["project"], data["status"])
+        return response
+
+    def _auto_run_pipeline(self, project_id, task_status):
+        if project_id is None or task_status == Status.DONE:
+            return
+        try:
+            from pipeline.service import start_pipeline_for_project
+
+            start_pipeline_for_project(project_id)
+        except Exception:
+            pass
 
     def _auto_suggest_priority(self, task):
         from ai_services.gemini_ai import suggest_task_priority

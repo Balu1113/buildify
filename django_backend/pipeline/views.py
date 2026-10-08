@@ -39,7 +39,12 @@ class PipelineRunViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         from .service import run_pipeline
-        run_pipeline(pipeline.project_id, pipeline_id=pipeline.id)
+        started = run_pipeline(pipeline.project_id, pipeline_id=pipeline.id)
+        if not started:
+            return Response(
+                {"error": "Pipeline is already running"},
+                status=status.HTTP_409_CONFLICT,
+            )
         return Response({"status": "restarted"})
 
     @action(detail=True, methods=["post"])

@@ -21,7 +21,12 @@ const TaskList = () => {
     try {
       const payload = { ...formData, project: formData.project || null };
       const r = await taskAPI.create(payload);
-      showToast(`Task created! AI priority: ${r.data.priority}`, "success");
+      if (payload.project) {
+        const name = projects.find((p) => String(p.id) === String(payload.project))?.name;
+        showToast(`Task assigned to "${name || "project"}" — pipeline started to complete it.`, "success");
+      } else {
+        showToast(`Task created! AI priority: ${r.data.priority}`, "success");
+      }
       setFormData({ title: "", description: "", priority: "medium", status: "todo", project: "" });
       fetchTasks();
     }

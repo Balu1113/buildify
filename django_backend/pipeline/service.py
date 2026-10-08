@@ -143,6 +143,14 @@ HOST_DJANGO_PACKAGE = "student_project_manager"
 
 QUALITY_GATE_ENV = "BUILDIFY_QUALITY_GATES"
 
+FINALIZATION_DEFERRAL_ERROR = "Tasks remain unfinished; finalization is pending"
+
+# At most one pipeline worker runs per project. Assignments made while a run is
+# active are remembered here and picked up as a follow-up run when it finishes.
+_pipeline_lock = threading.Lock()
+_active_projects = set()
+_pending_projects = set()
+
 
 def _task_acceptance_contract(task):
     """Build a structured, model-independent acceptance contract for every task."""
@@ -561,12 +569,79 @@ def _repair_workspace(task, project, project_files, project_dir, pipeline, diagn
 
 
 def run_pipeline(project_id, pipeline_id=None):
-    thread = threading.Thread(
-        target=_run_pipeline_worker,
-        args=(project_id, pipeline_id),
-        daemon=True,
+    """Start a pipeline worker unless one is already running for this project.
+
+    Returns True when a new worker thread was started.
+    """
+    with _pipeline_lock:
+        if project_id in _active_projects:
+            return False
+        _active_projects.add(project_id)
+
+    def _worker():
+        try:
+            _run_pipeline_worker(project_id, pipeline_id)
+        finally:
+            _finish_pipeline_run(project_id)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    try:
+        thread.start()
+    except Exception:
+        with _pipeline_lock:
+            _active_projects.discard(project_id)
+        raise
+    return True
+
+
+def start_pipeline_for_project(project_id):
+    """Start or resume the project pipeline so newly assigned tasks get completed.
+
+    Reuses the latest run, or opens a fresh one when that run was already accepted.
+    Returns True when a new worker thread was started.
+    """
+    latest = (
+        PipelineRun.objects.filter(project_id=project_id)
+        .order_by("-created_at")
+        .first()
     )
-    thread.start()
+    if latest is None or (
+        latest.finalization_state == PipelineRun.FinalizationState.ACCEPTED
+    ):
+        started = run_pipeline(project_id)
+    else:
+        started = run_pipeline(project_id, pipeline_id=latest.id)
+    if not started:
+        with _pipeline_lock:
+            _pending_projects.add(project_id)
+    return started
+
+
+def _finish_pipeline_run(project_id):
+    """Release the per-project slot and pick up assignments made during the run."""
+    with _pipeline_lock:
+        _active_projects.discard(project_id)
+        restart = project_id in _pending_projects
+        _pending_projects.discard(project_id)
+    if not restart:
+        return
+    if not Task.objects.filter(
+        project_id=project_id, status__in=["todo", "in_progress"]
+    ).exists():
+        return
+    latest = (
+        PipelineRun.objects.filter(project_id=project_id)
+        .order_by("-created_at")
+        .first()
+    )
+    if latest is None:
+        return
+    ended_cleanly = (
+        latest.error == FINALIZATION_DEFERRAL_ERROR
+        or latest.stage == PipelineRun.Stage.COMPLETED
+    )
+    if ended_cleanly:
+        start_pipeline_for_project(project_id)
 
 
 def _run_pipeline_worker(project_id, pipeline_id=None):
@@ -635,8 +710,9 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
         pipeline.append_log(f"[Agents] Using selected model only: {selected_model}")
 
         tasks = [task for task in all_tasks if task.status != "done"]
+        already_completed = sum(1 for task in all_tasks if task.status == "done")
         pipeline.total_tasks = len(all_tasks)
-        pipeline.completed_tasks = sum(1 for task in all_tasks if task.status == "done")
+        pipeline.completed_tasks = already_completed
         pipeline.save(update_fields=["total_tasks", "completed_tasks"])
         pipeline.append_log(f"Total tasks to process: {len(tasks)}")
 
@@ -1015,7 +1091,7 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
                 pipeline.append_log(f"[Stopped] {pipeline.error}")
                 raise PipelineStopped()
 
-            pipeline.completed_tasks = i + 1
+            pipeline.completed_tasks = already_completed + i + 1
             pipeline.save(update_fields=["completed_tasks"])
             if task_completed:
                 pipeline.append_log(f"[Done] Task '{task.title}' completed.")
@@ -1031,7 +1107,7 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
         if unfinished_tasks:
             pipeline.finalization_state = PipelineRun.FinalizationState.PENDING
             pipeline.stage = PipelineRun.Stage.FAILED
-            pipeline.error = "Tasks remain unfinished; finalization is pending"
+            pipeline.error = FINALIZATION_DEFERRAL_ERROR
             pipeline.save(update_fields=["stage", "error", "finalization_state"])
             pipeline.append_log("[Finalization] Deferred until all tasks are complete")
             return

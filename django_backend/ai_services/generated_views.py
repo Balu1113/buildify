@@ -49,9 +49,9 @@ _preview_jobs_lock = threading.Lock()
 _auto_repair_jobs = {}
 _auto_repair_jobs_lock = threading.Lock()
 _auto_repair_fingerprints = {}
-MAX_AUTO_REPAIRS_PER_ERROR = 1
-MAX_AUTO_REPAIR_FILES = 12
-MAX_AUTO_REPAIR_LOG_CHARS = 12000
+MAX_AUTO_REPAIRS_PER_ERROR = 3
+MAX_AUTO_REPAIR_FILES = 15
+MAX_AUTO_REPAIR_LOG_CHARS = 15000
 
 PREVIEW_TOKEN_SALT = "buildify.generated-preview"
 PREVIEW_TOKEN_MAX_AGE = 60 * 60
@@ -546,8 +546,8 @@ def _set_auto_repair_job(project_id, **updates):
         return dict(job)
 
 
-def _auto_repair_project(project_id, project_dir, output):
-    """Ask the existing code-modification service for a bounded runtime fix."""
+def _auto_repair_project(project_id, project_dir, output, attempt_number=1):
+    """Ask the existing code-modification service for a bounded runtime fix with progressive escalation."""
     close_old_connections()
     try:
         project = _resolve_project(project_id)
@@ -559,8 +559,20 @@ def _auto_repair_project(project_id, project_dir, output):
             raise RuntimeError("No generated source files are available to repair")
 
         diagnosis = output[-MAX_AUTO_REPAIR_LOG_CHARS:]
+
+        # Progressive escalation strategy based on attempt number
+        if attempt_number == 1:
+            strategy = "CONSERVATIVE: Make minimal changes, preserve all features, fix obvious issues only (syntax errors, missing imports, simple typos). Do not restructure code."
+        elif attempt_number == 2:
+            strategy = "TARGETED: Focus on specific error patterns:\\n  - Python: ImportError, ModuleNotFoundError, SyntaxError, IndentationError, AttributeError\\n  - Django: ImproperlyConfigured, AppRegistryNotReady, migration issues, settings errors\\n  - React/JS: ReferenceError, TypeError, hooks rules violations, missing dependencies\\n  - Runtime: Port already in use, EADDRINUSE, address already in use\\n  - Dependency: npm install failures, missing package.json, node_modules issues\\n  Apply targeted fixes for the detected error category."
+        else:  # attempt_number >= 3
+            strategy = "AGGRESSIVE: May restructure code, add missing files, change configurations, add fallback handling. Consider alternative implementations if the current approach is fundamentally flawed."
+
         request_text = f"""You are the Auto Bug Detection Agent and Solver.
 A runtime error occurred when running the generated application.
+
+=== ATTEMPT {attempt_number} OF {MAX_AUTO_REPAIRS_PER_ERROR} ===
+ESCALATION STRATEGY: {strategy}
 
 === RUNTIME ERROR & CRASH LOGS ===
 {diagnosis}
@@ -622,6 +634,8 @@ Debug and solve the issue:
                 "severity": "ready",
                 "stage": "auto_repair",
                 "message": "Auto-repair completed. Restarting the application.",
+                "attempt_number": attempt_number,
+                "max_attempts": MAX_AUTO_REPAIRS_PER_ERROR,
             }
         _set_auto_repair_job(
             project_id,
@@ -630,6 +644,8 @@ Debug and solve the issue:
             message="Auto-repair applied. Restarting the generated project...",
             changed_files=changed_files,
             summary=result.get("summary", "Applied an automatic runtime repair."),
+            attempt_number=attempt_number,
+            max_attempts=MAX_AUTO_REPAIRS_PER_ERROR,
         )
     except Exception as error:
         _set_auto_repair_job(
@@ -638,46 +654,58 @@ Debug and solve the issue:
             stage="auto_repair",
             message="Auto-repair could not resolve the runtime error.",
             error=str(error),
+            attempt_number=attempt_number,
+            max_attempts=MAX_AUTO_REPAIRS_PER_ERROR,
         )
     finally:
         close_old_connections()
 
 
 def _start_auto_repair(project_id, project_dir, output):
-    """Schedule one repair attempt for a distinct runtime failure."""
+    """Schedule one repair attempt for a distinct runtime failure with attempt tracking."""
     output = output[-MAX_AUTO_REPAIR_LOG_CHARS:]
     fingerprint = hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()
     existing = _get_auto_repair_job(project_id)
     if existing and existing.get("fingerprint") == fingerprint:
         return existing
     with _auto_repair_jobs_lock:
-        attempted = _auto_repair_fingerprints.setdefault(project_id, set())
-        if fingerprint in attempted:
+        project_fingerprints = _auto_repair_fingerprints.setdefault(project_id, {})
+        attempts = project_fingerprints.get(fingerprint, 0)
+        if attempts >= MAX_AUTO_REPAIRS_PER_ERROR:
             return {
                 "status": "failed",
                 "stage": "auto_repair",
-                "message": "Auto-repair already attempted this runtime error.",
-                "error": "Repeated runtime error after an automatic repair.",
+                "message": f"Maximum auto-repair attempts ({MAX_AUTO_REPAIRS_PER_ERROR}) reached for this error.",
+                "error": "Repeated runtime error after maximum automatic repair attempts.",
                 "output": output,
+                "attempt_number": attempts + 1,
+                "max_attempts": MAX_AUTO_REPAIRS_PER_ERROR,
             }
-        attempted.add(fingerprint)
+        # Increment attempt count
+        attempt_number = attempts + 1
+        project_fingerprints[fingerprint] = attempt_number
+        # Create fingerprint with attempt suffix for job tracking
+        attempt_fingerprint = f"{fingerprint}_attempt{attempt_number}"
 
     job = _set_auto_repair_job(
         project_id,
         status="repairing",
         stage="auto_repair",
-        message="Runtime error detected. Auto Bug Detection & Fix agent is analyzing it...",
-        fingerprint=fingerprint,
+        message=f"Runtime error detected. Auto Bug Detection & Fix agent is analyzing it (attempt {attempt_number}/{MAX_AUTO_REPAIRS_PER_ERROR})...",
+        fingerprint=attempt_fingerprint,
         output=output,
         changed_files=[],
+        attempt_number=attempt_number,
+        max_attempts=MAX_AUTO_REPAIRS_PER_ERROR,
     )
     thread = threading.Thread(
         target=_auto_repair_project,
-        args=(project_id, project_dir, output),
+        args=(project_id, project_dir, output, attempt_number),
         daemon=True,
     )
     thread.start()
     return job
+
 
 def _start_frontend_preparation(project_id, project_dir, script):
     """Start npm installation in a separate OS process."""
