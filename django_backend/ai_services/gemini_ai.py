@@ -3,10 +3,9 @@ import sys
 import ast
 import json
 import re
+import time
 import threading
-import signal
 from typing import Iterable, Optional
-from contextlib import contextmanager
 
 from django.conf import settings
 
@@ -21,8 +20,14 @@ MODEL_NAME = settings.GEMINI_MODEL_NAME
 FALLBACK_MODEL_NAMES = os.getenv("GEMINI_FALLBACK_MODELS", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# API timeout for Gemini calls (must be less than gunicorn's 30-second worker timeout)
+# Per-attempt AI timeout. Kept below AI_TOTAL_TIMEOUT_SECONDS, which bounds the
+# whole request (including model fallbacks) so it finishes well inside the
+# platform's request/gateway timeout.
 GEMINI_TIMEOUT_SECONDS = 20
+AI_TOTAL_TIMEOUT_SECONDS = 45
+# Upper bound on project source included in a chat prompt. Keeps prompts small
+# enough that the model answers within the request time budget.
+CHAT_FILES_CHAR_BUDGET = 60000
 
 _client = None
 _model_context = threading.local()
@@ -56,30 +61,29 @@ def _gemini_error(error: Exception) -> GeminiAPIError:
     return GeminiAPIError(message, provider_status)
 
 
-@contextmanager
-def _timeout_guard(seconds: int):
-    """Context manager that enforces a timeout using threading."""
-    result = {"timed_out": False}
-    
-    def timeout_handler():
-        result["timed_out"] = True
-    
-    # Use signal.alarm on Unix-like systems
-    if hasattr(signal, "alarm"):
-        def alarm_handler(signum, frame):
-            raise TimeoutError(f"Operation timed out after {seconds} seconds")
-        
-        old_handler = signal.signal(signal.SIGALRM, alarm_handler)
-        signal.alarm(seconds)
+def _call_with_timeout(fn, seconds):
+    """Run fn in a worker thread and raise TimeoutError if it exceeds seconds.
+
+    Unlike signal.alarm, this works from any thread (gunicorn gthread workers
+    handle requests outside the main thread, where signals are not allowed).
+    On timeout the abandoned worker thread is left to finish in the background.
+    """
+    box = {}
+
+    def target():
         try:
-            yield
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-    else:
-        # On Windows or if signal.alarm is not available, just yield without timeout
-        # This is not ideal but prevents breaking on Windows
-        yield
+            box["value"] = fn()
+        except BaseException as error:  # noqa: BLE001 - re-raised in the caller
+            box["error"] = error
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        raise TimeoutError(f"Operation timed out after {seconds} seconds")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 def get_client():
@@ -163,10 +167,17 @@ def _generate_content(contents):
         raise ValueError("GEMINI_MODEL_NAME is not set.")
 
     failures = []
+    deadline = time.monotonic() + AI_TOTAL_TIMEOUT_SECONDS
     for index, model in enumerate(models):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GeminiAPIError("; ".join(failures) or "AI request timed out", 504)
+        attempt_timeout = min(GEMINI_TIMEOUT_SECONDS, remaining)
         try:
-            with _timeout_guard(GEMINI_TIMEOUT_SECONDS):
-                response = client.models.generate_content(model=model, contents=contents)
+            response = _call_with_timeout(
+                lambda: client.models.generate_content(model=model, contents=contents),
+                attempt_timeout,
+            )
             if not response.text:
                 raise GeminiAPIError(f"Gemini model '{model}' returned an empty response.")
             return response.text
@@ -218,8 +229,10 @@ def generate_response(prompt: str, model_name: Optional[str] = None) -> str:
                     max_tokens=8192,
                 )
                 return completion.choices[0].message.content
-            with _timeout_guard(GEMINI_TIMEOUT_SECONDS):
-                response = get_client().models.generate_content(model=model_name, contents=prompt)
+            response = _call_with_timeout(
+                lambda: get_client().models.generate_content(model=model_name, contents=prompt),
+                GEMINI_TIMEOUT_SECONDS,
+            )
             return response.text
         return _generate_content(prompt)
     except TimeoutError as error:
@@ -614,11 +627,25 @@ Rules:
         raise GeminiAPIError(f"AI modification response could not be processed: {e}", 502) from e
 
 
+def _project_files_text(source_files: dict) -> str:
+    """Join project files into prompt text, capped to keep requests fast."""
+    parts = []
+    used = 0
+    for filename, content in source_files.items():
+        if used >= CHAT_FILES_CHAR_BUDGET:
+            parts.append(
+                "[Remaining project files omitted to stay within the response time budget.]"
+            )
+            break
+        chunk = content[:12000]
+        parts.append(f"=== {filename} ===\n{chunk}")
+        used += len(chunk)
+    return "\n\n".join(parts)
+
+
 def project_chat(source_files: dict, message: str, conversation=None, apply_changes=False, model_name: Optional[str] = None) -> Optional[dict]:
     """Advise on a generated project and optionally return an explicit change set."""
-    files_text = "\n\n".join(
-        f"=== {filename} ===\n{content[:12000]}" for filename, content in source_files.items()
-    )
+    files_text = _project_files_text(source_files)
     history_text = json.dumps(conversation or [], ensure_ascii=True)[-12000:]
     
     if apply_changes:

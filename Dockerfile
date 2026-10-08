@@ -77,4 +77,7 @@ RUN python manage.py collectstatic --noinput
 EXPOSE 8000
 RUN python manage.py collectstatic --noinput
 
-CMD ["sh", "-c", "python manage.py migrate --noinput && gunicorn student_project_manager.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 1 --timeout 120"]
+# gthread workers: health checks and other requests must keep being served
+# while a long AI call is in flight (a single sync worker blocks them, which
+# makes Render mark the instance unhealthy and return 504s).
+CMD ["sh", "-c", "python manage.py migrate --noinput && gunicorn student_project_manager.wsgi:application --bind 0.0.0.0:${PORT:-8000} --worker-class gthread --workers 1 --threads 4 --timeout 120"]

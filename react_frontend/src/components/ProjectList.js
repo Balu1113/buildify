@@ -380,7 +380,10 @@ const ProjectList = () => {
       showToast(changed ? `Applied: ${changed}` : "Advice received", "success");
     } catch (err) {
       const data = err.response?.data;
-      const message = data?.detail || data?.error || "Modification failed. Try again.";
+      const timedOut = err.response?.status === 504 || err.code === "ECONNABORTED";
+      const message = data?.detail || data?.error
+        || (timedOut ? "The AI took too long to respond. Please try again." : null)
+        || "Modification failed. Try again.";
       setModifyHistory((h) => [...h, { role: "ai", text: message }]);
       showToast(message, "error");
     }
