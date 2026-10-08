@@ -42,6 +42,10 @@ react_frontend/dist
 # Generated projects
 generated_projects
 
+# Local dev database (must never ship in the image)
+**/db.sqlite3
+**/db.sqlite3-journal
+
 # Logs
 *.log
 logs

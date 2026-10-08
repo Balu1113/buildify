@@ -38,6 +38,57 @@ def write_state(project_dir, state):
     )
 
 
+def ensure_python_dependencies(project_dir):
+    """Create the project venv and install backend requirements (cached)."""
+    from projects.runtime import (
+        find_requirements_files,
+        install_python_dependencies,
+        requirements_ready,
+    )
+
+    if not find_requirements_files(project_dir):
+        return 0
+
+    if requirements_ready(project_dir):
+        print(
+            "[Buildify Worker] Python dependencies already installed.",
+            flush=True,
+        )
+        return 0
+
+    write_state(
+        project_dir,
+        {
+            "status": "preparing",
+            "severity": "in-progress",
+            "error": None,
+            "stage": "python_dependencies",
+            "message": "Installing Python dependencies for the generated backend.",
+        },
+    )
+
+    ok, message = install_python_dependencies(project_dir)
+
+    if not ok:
+        write_state(
+            project_dir,
+            {
+                "status": "failed",
+                "severity": "error",
+                "stage": "python_dependencies",
+                "error": "pip_install_failed",
+                "message": message,
+            },
+        )
+        return 1
+
+    print(
+        "[Buildify Worker] Python dependencies installed.",
+        flush=True,
+    )
+    return 0
+
+
 def ensure_frontend_dependencies(project_dir, script):
     package_dir = os.path.dirname(
         os.path.join(
@@ -265,18 +316,38 @@ def ensure_frontend_dependencies(project_dir, script):
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (2, 3):
         print(
             "Usage: python -m ai_services.preview_worker "
-            "<project_dir> <script>",
+            "<project_dir> [script]",
             flush=True,
         )
         return 2
 
-    return ensure_frontend_dependencies(
-        sys.argv[1],
-        sys.argv[2],
+    project_dir = sys.argv[1]
+    script = sys.argv[2] if len(sys.argv) == 3 else None
+
+    if ensure_python_dependencies(project_dir) != 0:
+        return 1
+
+    if script:
+        return ensure_frontend_dependencies(
+            project_dir,
+            script,
+        )
+
+    # Backend-only project: nothing further to install.
+    write_state(
+        project_dir,
+        {
+            "status": "ready",
+            "severity": "ready",
+            "error": None,
+            "stage": "dependencies_installed",
+            "message": "Project dependencies are ready.",
+        },
     )
+    return 0
 
 
 if __name__ == "__main__":

@@ -18,6 +18,27 @@ DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
 ALLOWED_HOSTS = ["*"]
 
+# Render terminates TLS in front of the container; without this Django sees
+# plain HTTP and mis-computes secure cookies, is_secure(), and CSRF origins.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CSRF_TRUSTED_ORIGINS", "").split(",")
+    if origin.strip()
+] + [
+    "https://*.onrender.com",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
+# HTTPS-only hardening for deployments behind Render's TLS-terminating proxy.
+# Keep FORCE_HTTPS=false for plain-HTTP local development.
+FORCE_HTTPS = os.getenv("FORCE_HTTPS", "false").lower() == "true"
+SECURE_SSL_REDIRECT = FORCE_HTTPS
+SESSION_COOKIE_SECURE = FORCE_HTTPS
+CSRF_COOKIE_SECURE = FORCE_HTTPS
+SECURE_HSTS_SECONDS = 31536000 if FORCE_HTTPS else 0
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",

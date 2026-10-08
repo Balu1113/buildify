@@ -132,6 +132,7 @@ from pipeline.models import PipelineRun
 from tasks.models import Task
 from projects.models import Project
 from projects.storage import load_project_files, materialize_project, persist_workspace, save_generated_file
+from projects.runtime import ensure_project_python, generated_env as _runtime_generated_env
 
 
 # Stop after a small, bounded set of attempts so the user can switch models and retry.
@@ -370,12 +371,7 @@ def _load_project_files(project_dir, project=None):
 
 def _project_python(project_dir):
     """Return the project-local Python, creating its environment on demand."""
-    venv_dir = os.path.join(project_dir, ".venv")
-    python_name = "Scripts\\python.exe" if os.name == "nt" else "bin/python"
-    executable = os.path.join(venv_dir, python_name)
-    if not os.path.exists(executable):
-        subprocess.run([sys.executable, "-m", "venv", venv_dir], check=True, timeout=180)
-    return executable
+    return ensure_project_python(project_dir)
 
 # Helper functions for AST parsing and file tree building
 def extract_python_symbols(source_code: str) -> dict:
@@ -1328,7 +1324,16 @@ CRITICAL RULES:
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', '<generated_package>.settings')
    django.setup()
 
-10. **React frontend**: Place at frontend/ with standard create-react-app or Vite structure. Never mix frontend files into backend/.
+10. **React frontend**: Place at frontend/ using Vite (frontend/index.html, frontend/src/, package.json with "dev": "vite" and "build": "vite build"). Never mix frontend files into backend/. A create-react-app layout is only acceptable if Vite is impossible; prefer Vite.
+
+    **Preview basename rule (mandatory when using react-router)**: the app is
+    embedded under /api/ai/generated/<id>/preview/ in the host dashboard, so
+    the router MUST take its basename from the injected global:
+      - <BrowserRouter basename={{window.__BUILDIFY_PREVIEW_BASENAME__ || undefined}}>
+      - createBrowserRouter(routes, {{ basename: window.__BUILDIFY_PREVIEW_BASENAME__ }})
+      - <HashRouter> needs no basename.
+    Also read it for <Link to> helper base paths if applicable. Never assume
+    the app is served from "/" root only.
 
 11. **Mobile compatibility**: Frontend pages must be responsive from 320px
     through desktop widths. Use flexible layouts, readable touch-sized controls,
@@ -1872,22 +1877,7 @@ def _execute_pytest(project_dir):
 
 def _generated_environment(project_dir, roots):
     """Create a subprocess environment that cannot inherit host Django config."""
-    env = os.environ.copy()
-    for key in tuple(env):
-        if (
-            key == "DJANGO_SETTINGS_MODULE"
-            or key.startswith("DJANGO_")
-            or key.startswith("DATABASE_")
-            or key in {"DATABASE_URL", "SECRET_KEY", "DJANGO_SECRET_KEY", "ROOT_URLCONF"}
-        ):
-            env.pop(key, None)
-    env["PIPELINE_LOCAL"] = "1"
-    env["DATABASE_ENGINE"] = "sqlite3"
-    env["DJANGO_ALLOWED_HOSTS"] = "localhost,127.0.0.1"
-    env["PYTHONPATH"] = os.pathsep.join(
-        [root for root in roots if root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
-    )
-    return env
+    return _runtime_generated_env(roots)
 
 
 def _generated_project_reference_violations(project_dir):

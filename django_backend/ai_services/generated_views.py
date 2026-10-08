@@ -19,6 +19,7 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qsl, urlencode
 from urllib.request import Request, urlopen
 
 from django.http import HttpResponse
@@ -26,6 +27,12 @@ from django.db import close_old_connections
 
 from . import gemini_ai
 from projects.models import GeneratedFile, Project
+from projects.runtime import (
+    ensure_project_python,
+    generated_env,
+    install_python_dependencies,
+    requirements_ready,
+)
 from projects.storage import (
     delete_generated_file,
     load_project_files,
@@ -101,12 +108,25 @@ def _preview_runtime_script(project_id):
     return f"""<script>
 (() => {{
   const proxyPrefix = {json.dumps(proxy_prefix)};
+  // Generated apps with a router must use this as their basename so routes
+  // resolve while the preview is embedded under the Buildify origin.
+  window.__BUILDIFY_PREVIEW_BASENAME__ = proxyPrefix + "/";
+  try {{
+    if (!window.location.pathname.startsWith(proxyPrefix)) {{
+      history.replaceState(
+        history.state,
+        "",
+        proxyPrefix + window.location.pathname + window.location.search + window.location.hash
+      );
+    }}
+  }} catch (_) {{}}
   const rewrite = (value) => {{
     if (typeof value !== "string") return value;
     try {{
       const url = new URL(value, window.location.origin);
       const isLocal = url.origin === window.location.origin || /^(localhost|127\\.0\\.0\\.1)$/.test(url.hostname);
       if (isLocal && (url.pathname === "/api" || url.pathname.startsWith("/api/"))) {{
+        if (url.pathname.startsWith(proxyPrefix)) return value;
         return proxyPrefix + url.pathname + url.search + url.hash;
       }}
     }} catch (_) {{}}
@@ -207,10 +227,26 @@ def _terminal_agent_snapshot(project_id, project_dir, process_info=None):
     }
 
 
-def _find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _port_is_available(port):
+    """True when nothing is listening on this port on any interface."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+
+
+def _find_free_port(exclude=None):
+    exclude = exclude or set()
+    for _ in range(50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port not in exclude:
+            return port
+    raise RuntimeError("Could not find a free port for the generated project")
 
 
 def _detect_port_from_files(project_dir):
@@ -250,29 +286,16 @@ def _get_run_command(project_dir, script, port=None):
                 with open(req_file, "w") as f:
                     f.write("django\n")
 
-            try:
-                subprocess.run(
-                    [
-                        PYTHON,
-                        "-m",
-                        "pip",
-                        "install",
-                        "-r",
-                        req_file,
-                        "-q",
-                    ],
-                    cwd=req_dir,
-                    timeout=120,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=getattr(
-                        subprocess,
-                        "CREATE_NO_WINDOW",
-                        0,
-                    ),
-                )
-            except Exception:
-                pass
+        # Install into the project-local virtualenv so the generated app can
+        # never upgrade Django/DRF inside the Buildify interpreter.
+        try:
+            project_python = ensure_project_python(project_dir)
+        except Exception as error:
+            raise RuntimeError(f"Could not create the generated project virtualenv: {error}")
+
+        ok, message = install_python_dependencies(project_dir)
+        if not ok:
+            raise RuntimeError(message)
 
         # Create generated project's static directory
         os.makedirs(
@@ -285,15 +308,13 @@ def _get_run_command(project_dir, script, port=None):
 
         manage_py = os.path.join(req_dir, "manage.py")
 
-        migration_env = os.environ.copy()
-        migration_env.pop("DJANGO_SETTINGS_MODULE", None)
+        migration_env = generated_env()
+        migration_env["PYTHONDONTWRITEBYTECODE"] = "1"
 
         settings_module = _detect_settings_module(project_dir, manage_py)
 
         if settings_module:
             migration_env["DJANGO_SETTINGS_MODULE"] = settings_module
-
-        migration_env["PYTHONDONTWRITEBYTECODE"] = "1"
 
         print(f"[Buildify] Django migration cwd: {req_dir}", flush=True)
         print(f"[Buildify] Django manage.py: {manage_py}", flush=True)
@@ -301,7 +322,7 @@ def _get_run_command(project_dir, script, port=None):
         try:
             migrate_result = subprocess.run(
                 [
-                    PYTHON,
+                    project_python,
                     manage_py,
                     "migrate",
                     "--noinput",
@@ -345,29 +366,18 @@ def _get_run_command(project_dir, script, port=None):
             raise
 
         return [
-            PYTHON,
+            project_python,
             script,
             "runserver",
             f"0.0.0.0:{port or 0}",
             "--noreload",
         ]
     if script.endswith(".py"):
-        req_dir = _get_requirements_dir(project_dir, script)
-        if req_dir:
-            req_file = os.path.join(req_dir, "requirements.txt")
-            if os.path.exists(req_file):
-                try:
-                    subprocess.run(
-                        [PYTHON, "-m", "pip", "install", "-r", req_file, "-q"],
-                        cwd=req_dir,
-                        timeout=120,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-                except Exception:
-                    pass
-        return [PYTHON, script]
+        project_python = ensure_project_python(project_dir)
+        ok, message = install_python_dependencies(project_dir)
+        if not ok:
+            raise RuntimeError(message)
+        return [project_python, script]
     
     if script.endswith("package.json"):
         package_dir = os.path.dirname(os.path.join(project_dir, script))
@@ -391,8 +401,10 @@ def _get_run_command(project_dir, script, port=None):
 
         command = [npm_command, "run", script_name]
 
-        if port:
-            command.extend(["--", "--host", "0.0.0.0", "--port", str(port)])
+        if port and script_name == "dev":
+            # Vite-style dev servers accept these flags. A CRA "start" script
+            # would choke on them; it reads PORT from the environment instead.
+            command.extend(["--", "--host", "127.0.0.1", "--port", str(port)])
         return command
     return [PYTHON, script]
 
@@ -708,42 +720,15 @@ def _start_auto_repair(project_id, project_dir, output):
 
 
 def _start_frontend_preparation(project_id, project_dir, script):
-    """Start npm installation in a separate OS process."""
+    """Start dependency preparation (Python venv + npm) in an OS process."""
 
-    package_dir = os.path.dirname(
-        os.path.join(
-            project_dir,
-            script,
-        )
-    )
-
-    node_modules_dir = os.path.join(
-        package_dir,
-        "node_modules",
-    )
-
-    # ---------------------------------------------------------
-    # Already installed
-    # ---------------------------------------------------------
-    if os.path.isdir(node_modules_dir):
-        state = {
-            "status": "ready",
-            "severity": "ready",
-            "error": None,
-            "stage": "dependencies_installed",
-            "message": "Frontend dependencies are already installed.",
-            "package_dir": package_dir,
-        }
-
-        _write_preview_state(
-            project_dir,
-            state,
+    node_modules_dir = None
+    if script:
+        node_modules_dir = os.path.join(
+            os.path.dirname(os.path.join(project_dir, script)),
+            "node_modules",
         )
 
-        with _preview_jobs_lock:
-            _preview_jobs[project_id] = state
-
-        return state
     # ---------------------------------------------------------
     # Mark as preparing BEFORE starting worker
     # ---------------------------------------------------------
@@ -751,10 +736,11 @@ def _start_frontend_preparation(project_id, project_dir, script):
         "status": "preparing",
         "severity": "in-progress",
         "error": None,
-        "stage": "npm_install",
-        "message": "Installing React frontend dependencies.",
-        "package_dir": package_dir,
+        "stage": "preparing",
+        "message": "Installing project dependencies (Python and npm).",
     }
+    if node_modules_dir:
+        state["package_dir"] = os.path.dirname(node_modules_dir)
 
     _write_preview_state(
         project_dir,
@@ -765,14 +751,12 @@ def _start_frontend_preparation(project_id, project_dir, script):
         _preview_jobs[project_id] = state
 
     try:
+        command = [PYTHON, "-m", "ai_services.preview_worker", project_dir]
+        if script:
+            command.append(script)
+
         process = subprocess.Popen(
-            [
-                PYTHON,
-                "-m",
-                "ai_services.preview_worker",
-                project_dir,
-                script,
-            ],
+            command,
             cwd=os.path.dirname(
                 os.path.dirname(
                     os.path.abspath(__file__)
@@ -863,35 +847,57 @@ def _start_process(project_id, project_dir, script):
         scripts = [backend_script, frontend_script]
 
     # ---------------------------------------------------------
-    # Frontend dependency preparation
+    # Dependency preparation (Python venv + npm)
     # ---------------------------------------------------------
+    job = _get_preview_job(project_id)
+
+    if job and job.get("status") == "preparing":
+        return None, {
+            "status": "preparing",
+            "severity": "in-progress",
+            "error": None,
+            "stage": job.get("stage", "preparing"),
+            "message": job.get("message")
+            or "Installing project dependencies (Python and npm).",
+        }
+
+    node_modules_missing = False
     if frontend_script:
-        job = _get_preview_job(project_id)
-
-        if not job or job.get("status") != "ready":
-            if job and job.get("status") in {
-                "failed",
-                "environment-unavailable",
-                "not-ready",
-            }:
-                return None, job
-
-            job = _start_frontend_preparation(
-                project_id,
-                project_dir,
-                frontend_script,
+        node_modules_missing = not os.path.isdir(
+            os.path.join(
+                os.path.dirname(os.path.join(project_dir, frontend_script)),
+                "node_modules",
             )
+        )
+    python_deps_missing = bool(backend_script) and not requirements_ready(project_dir)
 
-            return None, {
-                "status": "preparing",
-                "severity": "in-progress",
-                "error": None,
-                "stage": job.get("stage", "npm_install"),
-                "message": "Preparing the React frontend. npm dependencies are being installed.",
-            }
+    if python_deps_missing or node_modules_missing:
+        if job and job.get("status") in {
+            # Permanent environment problems: do not spin on them.
+            "environment-unavailable",
+            "not-ready",
+        }:
+            return None, job
+
+        # "failed" states (pip/npm errors) fall through and retry on the
+        # next Run click; markers only exist after a successful install.
+        job = _start_frontend_preparation(
+            project_id,
+            project_dir,
+            frontend_script,
+        )
+
+        return None, {
+            "status": "preparing",
+            "severity": "in-progress",
+            "error": None,
+            "stage": job.get("stage", "preparing"),
+            "message": "Installing project dependencies (Python and npm).",
+        }
 
     processes = []
     frontend_info = None
+    used_ports = set()
 
     try:
         for current_script in scripts:
@@ -901,7 +907,10 @@ def _start_process(project_id, project_dir, script):
                 else None
             )
 
-            port = file_port or _find_free_port()
+            port = file_port if file_port and _port_is_available(file_port) else None
+            if port is None:
+                port = _find_free_port(used_ports)
+            used_ports.add(port)
 
             cmd = _get_run_command(
                 project_dir,
@@ -909,7 +918,7 @@ def _start_process(project_id, project_dir, script):
                 port,
             )
 
-            env = os.environ.copy()
+            env = generated_env()
             env["PORT"] = str(port)
             env["FLASK_RUN_PORT"] = str(port)
             env["FLASK_APP"] = "app.py"
@@ -1069,7 +1078,7 @@ def _detect_settings_module(project_dir, manage_script):
     return match.group(1) if match else None
 
 
-def _wait_for_port(port, process, timeout=30):
+def _wait_for_port(port, process, timeout=60):
     deadline = time.time() + timeout
 
     while time.time() < deadline:
@@ -1553,11 +1562,11 @@ def preview_project(request, project_id, preview_path=""):
     frontend_process = None
 
     for info in process_info["processes"]:
-        if info["script"].endswith("manage.py"):
-            backend_process = info
-
-        elif info["script"].endswith("package.json"):
+        if info["script"].endswith("package.json"):
             frontend_process = info
+        else:
+            # manage.py, main.py, app.py — anything that is not the frontend.
+            backend_process = info
 
     # ---------------------------------------------------------
     # Clean preview path
@@ -1575,7 +1584,9 @@ def preview_project(request, project_id, preview_path=""):
     if is_backend_request:
         target_process = backend_process
     else:
-        target_process = frontend_process
+        # Prefer the frontend dev server; fall back to the backend for
+        # Python-only projects that serve their own pages.
+        target_process = frontend_process or backend_process
 
     if target_process is None:
         return Response(
@@ -1583,7 +1594,7 @@ def preview_project(request, project_id, preview_path=""):
                 "error": (
                     "Generated backend process is not running."
                     if is_backend_request
-                    else "Frontend preview process is not running."
+                    else "No generated process is running."
                 ),
             },
             status=status.HTTP_409_CONFLICT,
@@ -1600,7 +1611,16 @@ def preview_project(request, project_id, preview_path=""):
     )
 
     if request.META.get("QUERY_STRING"):
-        target_url += f"?{request.META['QUERY_STRING']}"
+        forwarded_pairs = [
+            (key, value)
+            for key, value in parse_qsl(
+                request.META["QUERY_STRING"], keep_blank_values=True
+            )
+            # Never leak Buildify's own preview token to the generated app.
+            if key != "preview_token"
+        ]
+        if forwarded_pairs:
+            target_url += f"?{urlencode(forwarded_pairs)}"
 
     # ---------------------------------------------------------
     # Forward required headers
@@ -1671,6 +1691,9 @@ def preview_project(request, project_id, preview_path=""):
 
             # The token in the initial iframe URL is exchanged for a scoped
             # cookie so generated asset and API requests remain authorized.
+            # The cookie must be visible at the site root because preview
+            # assets are also served for root-level requests dispatched by
+            # the host catch-all view.
             response.set_cookie(
                 _preview_cookie_name(project.pk),
                 request.GET.get("preview_token") or request.COOKIES.get(
@@ -1678,9 +1701,9 @@ def preview_project(request, project_id, preview_path=""):
                 ),
                 max_age=PREVIEW_TOKEN_MAX_AGE,
                 httponly=True,
-                secure=not settings.DEBUG,
+                secure=request.is_secure(),
                 samesite="Lax",
-                path=f"/api/ai/generated/project_{project.pk}/preview/",
+                path="/",
             )
 
             return response
