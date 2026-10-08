@@ -1,7 +1,10 @@
+import os
+import shutil
 import threading
 import time
 from unittest.mock import patch
 
+from django.conf import settings
 from django.test import TestCase
 
 from pipeline import service
@@ -116,3 +119,67 @@ class FinishPipelineRunTests(TestCase):
         service._pending_projects.add(self.project.id)
         service._finish_pipeline_run(self.project.id)
         start.assert_not_called()
+
+
+class ResumeStoppedPipelineTests(TestCase):
+    """stage == FAILED is also the stop signal; resuming must clear it."""
+
+    def setUp(self):
+        self.project = Project.objects.create(name="Resume")
+        self.project_dir = os.path.join(
+            settings.GENERATED_PROJECTS_DIR, f"project_{self.project.pk}"
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.project_dir, ignore_errors=True)
+
+    @patch("pipeline.service._repair_workspace")
+    @patch("pipeline.service._run_developer")
+    def test_continue_unfinished_gets_past_the_first_stop_check(self, developer, repair):
+        # The first agent call raises: reaching it at all proves the run
+        # passed the hydration-time stop-check that used to raise
+        # PipelineStopped immediately after "[Workspace] Hydrated ...".
+        developer.side_effect = RuntimeError("reached-developer")
+        Task.objects.create(title="Build it", project=self.project, status="todo")
+        pipeline = PipelineRun.objects.create(
+            project=self.project,
+            stage=PipelineRun.Stage.FAILED,
+            error="Pipeline stop requested",
+        )
+
+        service._run_pipeline_worker(self.project.id, pipeline_id=pipeline.id)
+
+        pipeline.refresh_from_db()
+        self.assertIn("[Developer] Generating implementation...", pipeline.log)
+        self.assertGreater(developer.call_count, 1)
+        # The run ended through the normal retry-exhaustion path, not the
+        # stop-check firing on the stale FAILED stage.
+        self.assertIn("failed after", pipeline.error)
+        self.assertNotIn("stopped by user", pipeline.error)
+
+    @patch("pipeline.service._repair_workspace")
+    @patch("pipeline.service._run_developer")
+    def test_stop_request_during_agent_step_is_not_lost(self, developer, repair):
+        # A Stop click lands mid-agent-step; stage transitions afterwards
+        # overwrite stage, so the explicit stop request must still win.
+        def stop_then_interrupt(*args, **kwargs):
+            service.request_pipeline_stop(self.project.id)
+            raise RuntimeError("agent interrupted")
+
+        developer.side_effect = stop_then_interrupt
+        Task.objects.create(title="Build it", project=self.project, status="todo")
+        pipeline = PipelineRun.objects.create(
+            project=self.project,
+            stage=PipelineRun.Stage.FAILED,
+            error="Pipeline stop requested",
+        )
+
+        service._run_pipeline_worker(self.project.id, pipeline_id=pipeline.id)
+
+        pipeline.refresh_from_db()
+        self.assertEqual(pipeline.error, "Pipeline stopped by user")
+        self.assertIn("[Stopped] Pipeline stopped by user", pipeline.log)
+        # Stop wins on the next checkpoint instead of the pipeline quietly
+        # retrying after the stop: the developer ran once, then the attempt
+        # loop raised before invoking it again.
+        self.assertEqual(developer.call_count, 1)

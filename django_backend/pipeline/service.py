@@ -151,6 +151,10 @@ FINALIZATION_DEFERRAL_ERROR = "Tasks remain unfinished; finalization is pending"
 _pipeline_lock = threading.Lock()
 _active_projects = set()
 _pending_projects = set()
+# Stop requests raised while a worker is active. Kept separate from
+# PipelineRun.stage because stage transitions (DEVELOPING -> TESTING -> ...)
+# overwrite stage between checkpoints and would erase a stage-based stop.
+_stop_requested_projects = set()
 
 
 def _task_acceptance_contract(task):
@@ -336,7 +340,22 @@ class PipelineStopped(Exception):
     """Raised when a user stops a running pipeline."""
 
 
+def request_pipeline_stop(project_id):
+    """Record a user stop request that survives stage transitions."""
+    with _pipeline_lock:
+        _stop_requested_projects.add(project_id)
+
+
+def _clear_pipeline_stop(project_id):
+    with _pipeline_lock:
+        _stop_requested_projects.discard(project_id)
+
+
 def _raise_if_pipeline_stopped(pipeline):
+    with _pipeline_lock:
+        stop_requested = pipeline.project_id in _stop_requested_projects
+    if stop_requested:
+        raise PipelineStopped()
     pipeline.refresh_from_db(fields=["stage"])
     if pipeline.stage == PipelineRun.Stage.FAILED:
         raise PipelineStopped()
@@ -644,6 +663,9 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
     pipeline = None
     try:
         project = Project.objects.get(id=project_id)
+        # A new run is explicit consent to run: clear stop requests left
+        # over from a previous run so they cannot kill this one.
+        _clear_pipeline_stop(project_id)
         all_tasks = list(Task.objects.filter(project=project).order_by("id"))
         selected_model = Project.LEGACY_MODEL_ALIASES.get(
             project.ai_model, project.ai_model
@@ -654,8 +676,13 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
             if pipeline.finalization_state == PipelineRun.FinalizationState.ACCEPTED:
                 pipeline.append_log("[Finalization] Project already accepted; no work rerun")
                 return
+            # stage == FAILED doubles as the stop signal checked by
+            # _raise_if_pipeline_stopped. A resumed run must leave that state
+            # behind, otherwise the first stop-check after hydration raises
+            # PipelineStopped and "Continue unfinished" dies immediately.
             pipeline.error = ""
-            pipeline.save(update_fields=["error"])
+            pipeline.stage = PipelineRun.Stage.PLANNING
+            pipeline.save(update_fields=["error", "stage"])
         else:
             pipeline = PipelineRun.objects.create(
                 project=project,

@@ -56,6 +56,9 @@ class PipelineRunViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        from .service import request_pipeline_stop
+
+        request_pipeline_stop(pipeline.project_id)
         pipeline.stage = PipelineRun.Stage.FAILED
         pipeline.error = "Pipeline stop requested"
         pipeline.append_log("[Stop requested] Waiting for the current agent step to finish...")
