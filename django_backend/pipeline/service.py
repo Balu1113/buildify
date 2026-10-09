@@ -2030,6 +2030,128 @@ def _literal_assignment(tree, name, default=None):
     return default
 
 
+def _installed_app_module(entry):
+    """Return the package module an INSTALLED_APPS entry registers."""
+    if not isinstance(entry, str) or not entry.strip():
+        return None
+    parts = entry.strip().split(".")
+    if len(parts) > 1 and parts[-1][:1].isupper():
+        parts = parts[:-1]
+    return ".".join(parts) or None
+
+
+def _package_module_for(path, roots):
+    """Dotted package path of the directory containing path, relative to the best root."""
+    directory = os.path.dirname(os.path.abspath(path))
+    for root in roots:
+        if not root:
+            continue
+        try:
+            relative = os.path.relpath(directory, os.path.abspath(root))
+        except ValueError:
+            continue
+        if relative == os.curdir or relative.startswith(os.pardir):
+            continue
+        return relative.replace(os.sep, ".")
+    return None
+
+
+def _appconfig_declared_name(apps_path):
+    """Read the literal name from an app's AppConfig subclass, if present."""
+    try:
+        with open(apps_path, "r", encoding="utf-8", errors="replace") as handle:
+            tree = ast.parse(handle.read())
+    except (OSError, SyntaxError):
+        return None
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if not any(
+            (isinstance(base, ast.Attribute) and base.attr == "AppConfig")
+            or (isinstance(base, ast.Name) and base.id == "AppConfig")
+            for base in node.bases
+        ):
+            continue
+        for statement in node.body:
+            if isinstance(statement, ast.Assign):
+                targets = [t for t in statement.targets if isinstance(t, ast.Name)]
+                value = statement.value
+            elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+                targets = [statement.target]
+                value = statement.value
+            else:
+                continue
+            for target in targets:
+                if target.id == "name":
+                    try:
+                        declared = ast.literal_eval(value)
+                    except (ValueError, SyntaxError):
+                        continue
+                    if isinstance(declared, str) and declared.strip():
+                        return declared.strip()
+    return None
+
+
+def _declares_unlabelled_models(models_path):
+    """True when models.py defines a concrete model without an explicit app_label."""
+    try:
+        with open(models_path, "r", encoding="utf-8", errors="replace") as handle:
+            tree = ast.parse(handle.read())
+    except (OSError, SyntaxError):
+        return False
+
+    def base_name(base):
+        if isinstance(base, ast.Name):
+            return base.id
+        if isinstance(base, ast.Attribute):
+            return base.attr
+        return None
+
+    classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+    model_classes = set()
+    changed = True
+    while changed:
+        changed = False
+        for node in classes:
+            if node.name in model_classes:
+                continue
+            for base in node.bases:
+                name = base_name(base)
+                if name == "Model" or (name and name.endswith("Model") and name[0].isupper()) or name in model_classes:
+                    model_classes.add(node.name)
+                    changed = True
+                    break
+
+    for node in classes:
+        if node.name not in model_classes:
+            continue
+        meta = next(
+            (child for child in node.body if isinstance(child, ast.ClassDef) and child.name == "Meta"),
+            None,
+        )
+        values = {}
+        if meta is not None:
+            for statement in meta.body:
+                if isinstance(statement, ast.Assign):
+                    targets = [t.id for t in statement.targets if isinstance(t, ast.Name)]
+                    value = statement.value
+                elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+                    targets = [statement.target.id]
+                    value = statement.value
+                else:
+                    continue
+                for target in targets:
+                    if target in {"abstract", "app_label"}:
+                        try:
+                            values[target] = ast.literal_eval(value)
+                        except (ValueError, SyntaxError):
+                            values[target] = None
+        if values.get("abstract") or values.get("app_label"):
+            continue
+        return True
+    return False
+
+
 def _inspect_generated_workspace(project_dir):
     """Inventory the actual generated workspace before any finalization repair."""
     files = {}
@@ -2151,6 +2273,58 @@ def _generated_consistency_findings(project_dir, inventory=None):
                     "severity": "critical",
                     "recommended_repair": "Use an existing generated app package or create its complete package, URLs, models, and migrations.",
                 })
+        installed_modules = {
+            module
+            for module in (_installed_app_module(app) for app in installed_apps)
+            if module
+        }
+        for models_path in inventory.get("models_py", []):
+            if "/migrations/" in models_path or models_path.startswith("migrations/"):
+                continue
+            absolute_models = os.path.join(project_dir, models_path.replace("/", os.sep))
+            package_module = _package_module_for(absolute_models, roots)
+            if not package_module:
+                continue
+            apps_path = os.path.join(os.path.dirname(absolute_models), "apps.py")
+            if os.path.isfile(apps_path):
+                declared_name = _appconfig_declared_name(apps_path)
+                if declared_name and declared_name != package_module:
+                    findings.append({
+                        "check_name": "Generated Django consistency",
+                        "failure_type": "appconfig_name_mismatch",
+                        "exact_error": (
+                            f"{os.path.relpath(apps_path, project_dir).replace(os.sep, '/')} "
+                            f"declares name '{declared_name}' but the package is '{package_module}'"
+                        ),
+                        "affected_path_or_module": declared_name,
+                        "severity": "critical",
+                        "recommended_repair": (
+                            f"Set name = '{package_module}' in AppConfig so it matches the "
+                            "package path, and use the same path in INSTALLED_APPS."
+                        ),
+                    })
+            covered = any(
+                package_module == installed or package_module.startswith(installed + ".")
+                for installed in installed_modules
+            )
+            if covered:
+                continue
+            if not _declares_unlabelled_models(absolute_models):
+                continue
+            findings.append({
+                "check_name": "Generated Django consistency",
+                "failure_type": "unregistered_model_app",
+                "exact_error": (
+                    f"{models_path} defines models under package {package_module} "
+                    "which no INSTALLED_APPS entry registers"
+                ),
+                "affected_path_or_module": package_module,
+                "severity": "critical",
+                "recommended_repair": (
+                    f"List '{package_module}' in INSTALLED_APPS (or move the app under an "
+                    "already installed package) so Django can resolve its app_label."
+                ),
+            })
         root_url_module = _literal_assignment(settings_tree, "ROOT_URLCONF")
         root_url_path = _module_file(project_dir, root_url_module, roots)
         if root_url_path:
