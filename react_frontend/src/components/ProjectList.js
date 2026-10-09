@@ -228,12 +228,18 @@ const ProjectList = () => {
   const [modifyPrompt, setModifyPrompt] = useState("");
   const [modifyLoading, setModifyLoading] = useState(false);
   const [modifyHistory, setModifyHistory] = useState([]);
-  const [applyChatChanges, setApplyChatChanges] = useState(false);
+  const [history, setHistory] = useState([]);
+  const [historyRange, setHistoryRange] = useState("all");
+  const [historySort, setHistorySort] = useState("newest");
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const [expandedRun, setExpandedRun] = useState(null);
   const logRef = useRef(null);
   const pollRef = useRef(null);
   const runPollRef = useRef(null);
   const modifyEndRef = useRef(null);
   const autoRunProjectRef = useRef(null);
+  const historyFetchRef = useRef(null);
   const previewSignatureRef = useRef(null);
   const lastPatchedModelRef = useRef(null);
 
@@ -245,10 +251,53 @@ const ProjectList = () => {
   const fetchPipeline = async (pid) => { try { const r = await pipelineAPI.getByProject(pid); if (r.data?.length) { setPipeline(r.data[0]); return r.data[0]; } } catch {} return null; };
   const fetchFiles = async (pid) => { try { const r = await generatedAPI.files(pid); const nextFiles = r.data.files || []; setFiles(nextFiles); return nextFiles; } catch { setFiles([]); return []; } };
 
+  const historyParams = (pid) => {
+    const params = { project_id: pid, range: historyRange, sort: historySort };
+    if (historyRange === "custom") {
+      if (customFrom) params.start = new Date(customFrom).toISOString();
+      if (customTo) params.end = new Date(customTo).toISOString();
+    }
+    return params;
+  };
+
+  const fetchHistory = async (pid) => {
+    if (!pid) return;
+    if (historyRange === "custom" && !customFrom && !customTo) { setHistory([]); return; }
+    try { const r = await pipelineAPI.list(historyParams(pid)); setHistory(r.data || []); } catch {}
+  };
+
+  historyFetchRef.current = () => { if (selectedProject) fetchHistory(selectedProject); };
+
+  useEffect(() => {
+    if (!selectedProject) { setHistory([]); return; }
+    fetchHistory(selectedProject);
+  }, [selectedProject, historyRange, historySort, customFrom, customTo]);
+
+  const runDuration = (run) => {
+    const ms = new Date(run.updated_at) - new Date(run.created_at);
+    if (!isFinite(ms) || ms < 0) return "-";
+    const s = Math.round(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ${s % 60}s`;
+    return `${Math.floor(m / 60)}h ${m % 60}m`;
+  };
+
+  const chipStyle = (active) => ({
+    padding: "4px 11px",
+    borderRadius: 999,
+    fontSize: 11,
+    cursor: "pointer",
+    border: `1px solid ${active ? "var(--accent)" : "var(--border, rgba(128,128,128,0.35))"}`,
+    background: active ? "var(--accent-glow)" : "transparent",
+    color: active ? "var(--accent)" : "var(--text-muted)",
+  });
+
   const startPolling = (pid) => {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
       const p = await fetchPipeline(pid); await fetchTasks(pid); const currentFiles = await fetchFiles(pid);
+      if (historyFetchRef.current) historyFetchRef.current();
       if (p && (p.stage === "completed" || p.stage === "failed")) {
         clearInterval(pollRef.current); pollRef.current = null; setLoading(false);
         if (p.stage === "completed") {
@@ -297,6 +346,7 @@ const ProjectList = () => {
       await pipelineAPI.start(pipeline.id);
       showToast("Retrying unfinished tasks...", "info");
       await fetchPipeline(selectedProject);
+      if (historyFetchRef.current) historyFetchRef.current();
       startPolling(selectedProject);
     } catch (err) {
       setLoading(false);
@@ -310,13 +360,34 @@ const ProjectList = () => {
       await pipelineAPI.stop(pipeline.id);
       showToast("Stop requested. The current agent step will finish first.", "info");
       await fetchPipeline(selectedProject);
+      if (historyFetchRef.current) historyFetchRef.current();
     } catch (err) {
       showToast(err.response?.data?.error || "Unable to stop the pipeline.", "error");
     }
   };
 
+  const handleClearHistory = async () => {
+    if (!selectedProject || historyRange === "live") return;
+    if (historyRange === "custom" && !customFrom && !customTo) {
+      showToast("Pick a start and/or end time before clearing.", "error");
+      return;
+    }
+    if (!window.confirm("Clear build history for this project? Live builds are kept.")) return;
+    try {
+      const r = await pipelineAPI.clearHistory(historyParams(selectedProject));
+      showToast(`Cleared ${r.data.deleted} run${r.data.deleted === 1 ? "" : "s"} from history.`, "success");
+      setExpandedRun(null);
+      await fetchHistory(selectedProject);
+      const pr = await pipelineAPI.getByProject(selectedProject);
+      setPipeline(pr.data?.length ? pr.data[0] : null);
+    } catch (err) {
+      showToast(err.response?.data?.error || "Unable to clear history.", "error");
+    }
+  };
+
   const handleSelect = async (p) => {
     setSelectedProject(p.id); setSelectedAiModel(p.ai_model || "deepseek/deepseek-chat-v3.1"); setSelectedFile(null); setFileContent(""); setRunInfo(null); setFileTab("view"); setModifyHistory([]); setTerminalInfo(null); setPreparationStatus(null); setPreviewToken(null);
+    setExpandedRun(null);
     autoRunProjectRef.current = null;
     previewSignatureRef.current = null;
     setRunState({ status: "idle", port: null });
@@ -757,6 +828,58 @@ const ProjectList = () => {
                 <div ref={logRef} className="terminal" style={{ height: 200 }}>{pipeline.log || "Initializing..."}</div>
               </div>
             )}
+
+            <div className="card" style={{ marginBottom: 16 }}>
+              <div className="card-header">
+                <div>
+                  <div className="card-title">Build History</div>
+                  <div className="card-subtitle">Review and filter past pipeline runs</div>
+                </div>
+                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                  <button className="btn btn-sm" onClick={() => setHistorySort(historySort === "newest" ? "oldest" : "newest")}>
+                    {historySort === "newest" ? "↓ Newest first" : "↑ Oldest first"}
+                  </button>
+                  <button className="btn btn-danger btn-sm" onClick={handleClearHistory} disabled={historyRange === "live"}>
+                    Clear history
+                  </button>
+                </div>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10, alignItems: "center" }}>
+                {[["live", "Live"], ["hour", "Last 1 hour"], ["day", "Last 24 hours"], ["custom", "Custom"], ["all", "All"]].map(([value, label]) => (
+                  <button key={value} style={chipStyle(historyRange === value)} onClick={() => setHistoryRange(value)}>{label}</button>
+                ))}
+                {historyRange === "custom" && (
+                  <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+                    <input type="datetime-local" className="input" style={{ width: 178, padding: "4px 8px", fontSize: 11 }} value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} />
+                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>to</span>
+                    <input type="datetime-local" className="input" style={{ width: 178, padding: "4px 8px", fontSize: 11 }} value={customTo} onChange={(e) => setCustomTo(e.target.value)} />
+                  </span>
+                )}
+              </div>
+              {historyRange === "custom" && !customFrom && !customTo ? (
+                <div style={{ fontSize: 12, color: "var(--text-muted)" }}>Pick a start and/or end time to load runs.</div>
+              ) : history.length === 0 ? (
+                <div style={{ fontSize: 12, color: "var(--text-muted)" }}>No runs match this filter.</div>
+              ) : (
+                <div style={{ display: "grid", gap: 6 }}>
+                  {history.map((run) => (
+                    <div key={run.id} onClick={() => setExpandedRun(expandedRun === run.id ? null : run.id)} style={{ border: "1px solid var(--border, rgba(128,128,128,0.3))", borderRadius: 10, padding: "8px 10px", cursor: "pointer", background: expandedRun === run.id ? "var(--bg-hover)" : "transparent" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                        <span className={`badge badge-${run.stage}`}>{STAGE_ICONS[run.stage] || "⚙"} {run.stage}</span>
+                        <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{new Date(run.created_at).toLocaleString()}</span>
+                        <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{run.completed_tasks}/{run.total_tasks} tasks</span>
+                        <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{runDuration(run)}</span>
+                        {run.finalization_state === "accepted" && <span className="badge badge-done">accepted</span>}
+                      </div>
+                      {run.error && <div style={{ fontSize: 11, color: "var(--danger)", marginTop: 4 }}>{run.error}</div>}
+                      {expandedRun === run.id && (
+                        <pre className="terminal" style={{ marginTop: 8, maxHeight: 220, fontSize: 11, whiteSpace: "pre-wrap" }}>{run.log || "No log output."}</pre>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
 
             <div className="card" style={{ marginBottom: 16 }}>
               <div className="card-header"><div className="card-title">Tasks</div><span className="badge" style={{ background: "var(--bg-hover)", color: "var(--text-muted)" }}>{tasks.filter(t => t.status === "done").length}/{tasks.length}</span></div>

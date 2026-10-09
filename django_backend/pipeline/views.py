@@ -1,9 +1,76 @@
-from rest_framework import viewsets, status
+from datetime import timedelta
+
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from .models import PipelineRun
 from .serializers import PipelineRunSerializer
 from tasks.models import Task
+
+# Stages where a worker is (or can be) actively running. History filters use
+# this to answer "what is live", and clear_history never deletes these runs so
+# an active build can always be stopped or continued.
+RUNNING_STAGES = (
+    PipelineRun.Stage.PLANNING,
+    PipelineRun.Stage.DEVELOPING,
+    PipelineRun.Stage.TESTING,
+    PipelineRun.Stage.DEBUGGING,
+    PipelineRun.Stage.REVIEWING,
+)
+
+
+def _parse_time_bound(value, field_name):
+    parsed = parse_datetime(value)
+    if parsed is None:
+        raise ValidationError(
+            {field_name: "Use an ISO 8601 datetime, e.g. 2026-10-09T14:30:00Z."}
+        )
+    if timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed)
+    return parsed
+
+
+def _apply_history_filters(queryset, params):
+    """Filter pipeline runs by a named time range.
+
+    Supported ``range`` values: ``live`` (running now), ``hour`` (last hour),
+    ``day`` (last 24 hours), ``custom`` (explicit ``start``/``end`` bounds),
+    and ``all`` (default). Unknown values fall back to ``all``.
+    """
+    range_name = (params.get("range") or "all").lower()
+    now = timezone.now()
+    if range_name == "live":
+        return queryset.filter(stage__in=RUNNING_STAGES)
+    if range_name == "hour":
+        return queryset.filter(created_at__gte=now - timedelta(hours=1))
+    if range_name == "day":
+        return queryset.filter(created_at__gte=now - timedelta(days=1))
+    if range_name == "custom":
+        start = params.get("start")
+        end = params.get("end")
+        if not start and not end:
+            raise ValidationError(
+                {"start": "A custom range requires a start and/or end datetime."}
+            )
+        if start:
+            queryset = queryset.filter(
+                created_at__gte=_parse_time_bound(start, "start")
+            )
+        if end:
+            queryset = queryset.filter(
+                created_at__lte=_parse_time_bound(end, "end")
+            )
+        return queryset
+    return queryset
+
+
+def _apply_sort(queryset, params):
+    if (params.get("sort") or "newest").lower() == "oldest":
+        return queryset.order_by("created_at")
+    return queryset.order_by("-created_at")
 
 
 class PipelineRunViewSet(viewsets.ReadOnlyModelViewSet):
@@ -15,7 +82,29 @@ class PipelineRunViewSet(viewsets.ReadOnlyModelViewSet):
         project_id = self.request.query_params.get("project_id")
         if project_id:
             queryset = queryset.filter(project_id=project_id)
-        return queryset
+        queryset = _apply_history_filters(queryset, self.request.query_params)
+        return _apply_sort(queryset, self.request.query_params)
+
+    @action(detail=False, methods=["post"])
+    def clear_history(self, request):
+        """Delete finished runs for a project, optionally scoped by range.
+
+        Live (running) runs are always kept so an active build is never
+        removed from under the worker or the UI.
+        """
+        project_id = request.query_params.get(
+            "project_id"
+        ) or request.data.get("project_id")
+        if not project_id:
+            return Response(
+                {"error": "project_id is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        queryset = PipelineRun.objects.filter(project_id=project_id)
+        queryset = queryset.exclude(stage__in=RUNNING_STAGES)
+        queryset = _apply_history_filters(queryset, request.query_params)
+        deleted, _details = queryset.delete()
+        return Response({"deleted": deleted})
 
     @action(detail=True, methods=["post"])
     def start(self, request, pk=None):

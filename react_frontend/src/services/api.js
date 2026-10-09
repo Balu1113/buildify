@@ -95,6 +95,7 @@ export const pipelineAPI = {
   getByProject: (projectId) => api.get("/pipeline/", { params: { project_id: projectId } }),
   start: (id) => api.post(`/pipeline/${id}/start/`),
   stop: (id) => api.post(`/pipeline/${id}/stop/`),
+  clearHistory: (params = {}) => api.post("/pipeline/clear_history/", null, { params }),
 };
 
 const normalizeGeneratedProjectId = (projectId) => {
