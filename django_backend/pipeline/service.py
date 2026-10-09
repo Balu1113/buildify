@@ -746,35 +746,27 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
             f"[Workspace] Hydrated {len(project_files)} existing files from generated project"
         )
 
+        # ------------------------------------------------------------------
+        # PHASE 2: DEVELOPING
+        # Every task is implemented to completion before any testing,
+        # debugging, or reviewing runs. Only the Developer executes in this
+        # phase: preflight, quality-gate, and verification failures are fed
+        # straight back to the Developer on the next attempt, and the stage
+        # stays DEVELOPING for the whole phase so verification can never
+        # interleave with development.
+        # ------------------------------------------------------------------
+        pipeline.stage = PipelineRun.Stage.DEVELOPING
+        pipeline.save(update_fields=["stage"])
+        pipeline.append_log(
+            f"[Phase] DEVELOPING: implementing all {len(tasks)} task(s) "
+            "before any testing, debugging, or reviewing"
+        )
+        # One context per task, carried into the verification phase so the
+        # Tester, Debugger, and Reviewer see what the Developer produced.
+        task_contexts = {}
+
         for i, task in enumerate(tasks):
             _raise_if_pipeline_stopped(pipeline)
-            diagnostics = _project_preflight(project_files)
-            if diagnostics:
-                pipeline.stage = PipelineRun.Stage.DEBUGGING
-                pipeline.save(update_fields=["stage"])
-                pipeline.append_log(
-                    f"[Preflight] Found {len(diagnostics)} existing file failure(s) before task '{task.title}'"
-                )
-                for diagnostic in diagnostics[:10]:
-                    pipeline.append_log(f"[Preflight] {diagnostic}")
-                try:
-                    repaired = _repair_workspace(
-                        task, project, project_files, project_dir, pipeline,
-                        diagnostics, selected_model,
-                    )
-                    remaining = _project_preflight(project_files)
-                    if repaired and not remaining:
-                        pipeline.append_log("[Preflight] Debugger repaired all detected file failures")
-                    elif remaining:
-                        pipeline.append_log(
-                            f"[Preflight] {len(remaining)} failure(s) remain after repair"
-                        )
-                        pipeline.append_log("[Preflight] Blocking task processing until the workspace is repaired")
-                        task.status = "todo"
-                        task.save(update_fields=["status"])
-                        break
-                except Exception as error:
-                    pipeline.append_log(f"[Preflight] Repair error: {error}")
             task.status = "in_progress"
             task.save(update_fields=["status"])
             pipeline.current_task = task.title
@@ -784,6 +776,8 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
             pipeline.append_log(f"TASK {i+1}/{len(tasks)}: {task.title}")
             pipeline.append_log(f"Priority: {task.priority}")
             pipeline.append_log(f"{'='*60}")
+
+            dev_completed = False
 
             task_completed = False
             last_error = None
@@ -815,7 +809,28 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
                     f"attempt {attempt + 1}/{MAX_RETRIES + 1}"
                 )
                 if attempt > 0:
-                    pipeline.append_log(f"\n--- Retry attempt {attempt}/{MAX_RETRIES} ---")
+                    pipeline.append_log(f"\n--- Developer retry attempt {attempt}/{MAX_RETRIES} ---")
+
+                attempt_issues = []
+
+                # Preflight failures are handed to the Developer as retry
+                # feedback instead of the Debugger so no debugging happens
+                # while development is still in progress.
+                diagnostics = _project_preflight(project_files)
+                if diagnostics:
+                    pipeline.append_log(
+                        f"[Preflight] Found {len(diagnostics)} existing file failure(s); "
+                        "Developer must repair them with this task"
+                    )
+                    for diagnostic in diagnostics[:10]:
+                        pipeline.append_log(f"[Preflight] {diagnostic}")
+                    attempt_issues.extend({
+                        "severity": "major",
+                        "category": "syntax",
+                        "issue": diagnostic,
+                        "why": "An existing workspace file fails a deterministic preflight check.",
+                        "required_fix": "Repair this file as part of the current implementation.",
+                    } for diagnostic in diagnostics)
 
                 # DEVELOPER
                 pipeline.stage = PipelineRun.Stage.DEVELOPING
@@ -877,16 +892,17 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
                     if verification_errors:
                         last_error = "Verification errors: " + "; ".join(verification_errors)
                         pipeline.append_log(f"[Developer] {last_error}")
-                        pipeline.stage = PipelineRun.Stage.DEBUGGING
-                        pipeline.save(update_fields=["stage"])
-                        pipeline.append_log("[Debugger] Repairing developer validation failures...")
-                        try:
-                            _repair_workspace(
-                                task, project, project_files, project_dir, pipeline,
-                                verification_errors, selected_model,
-                            )
-                        except Exception as repair_error:
-                            pipeline.append_log(f"[Debugger] Repair error: {repair_error}")
+                        pipeline.append_log(
+                            "[Developer] Returning validation failures for repair on the next attempt"
+                        )
+                        attempt_issues.extend({
+                            "severity": "major",
+                            "category": "verification",
+                            "issue": error,
+                            "why": "Generated file failed deterministic content validation.",
+                            "required_fix": "Regenerate the file with valid, complete content.",
+                        } for error in verification_errors)
+                        retry_context["unresolved_issues"] = attempt_issues
                         continue
 
                     # Validate imports for Python files
@@ -904,29 +920,119 @@ def _run_pipeline_worker(project_id, pipeline_id=None):
                             for w in import_warnings:
                                 pipeline.append_log(f"[Verify] Import warning: {fname}: {w}")
 
+                    # Accept the attempt only when the whole workspace passes
+                    # preflight; remaining failures return to the Developer.
+                    remaining = _project_preflight(project_files)
+                    if remaining:
+                        last_error = (
+                            f"{len(remaining)} preflight failure(s) remain after generation"
+                        )
+                        pipeline.append_log(f"[Developer] {last_error}")
+                        attempt_issues.extend({
+                            "severity": "major",
+                            "category": "syntax",
+                            "issue": diagnostic,
+                            "why": "Workspace file fails a deterministic preflight check.",
+                            "required_fix": "Repair the file before the implementation is accepted.",
+                        } for diagnostic in remaining)
+                        retry_context["unresolved_issues"] = attempt_issues
+                        continue
+
+                    retry_context["unresolved_issues"] = []
                     last_error = None
+                    dev_completed = True
+                    break
 
                 except Exception as e:
                     last_error = f"Developer error: {e}"
-                    retry_context["unresolved_issues"] = [{
+                    attempt_issues.append({
                         "severity": "major",
                         "category": "implementation",
                         "issue": last_error,
                         "why": "The Developer stage did not produce a valid implementation.",
                         "required_fix": "Resolve the reported developer error and return complete files.",
-                    }]
+                    })
+                    retry_context["unresolved_issues"] = attempt_issues
                     pipeline.append_log(f"[Developer] Error: {e}")
+                    continue
+
+            if not dev_completed:
+                pipeline.stage = PipelineRun.Stage.FAILED
+                pipeline.error = (
+                    f"Task '{task.title}' failed after {MAX_RETRIES + 1} attempts with model '{selected_model}'. "
+                    "Please select another model and retry."
+                )
+                pipeline.save(update_fields=["stage", "error"])
+                pipeline.append_log(f"[Failed] Task '{task.title}' failed after {MAX_RETRIES + 1} attempts.")
+                pipeline.append_log(
+                    "[FailureContext] " + _retry_context_text(retry_context)
+                )
+                pipeline.append_log(f"[Stopped] {pipeline.error}")
+                raise PipelineStopped()
+
+            task_contexts[task.id] = (acceptance_contract, retry_context)
+            pipeline.append_log(
+                f"[Done] Development of '{task.title}' complete; "
+                "verification runs after every task is developed."
+            )
+            pipeline.flush_log()
+
+        # ------------------------------------------------------------------
+        # PHASE 3: TESTING -> DEBUGGING -> REVIEWING
+        # Runs only after every task has been fully developed. Stages move
+        # through testing, debugging, and reviewing (and cycle between those
+        # three on retries) but never back to developing: the Developer agent
+        # is never invoked again from here on.
+        # ------------------------------------------------------------------
+        pipeline.append_log(
+            f"[Phase] VERIFY: testing, debugging, and reviewing {len(tasks)} developed task(s)"
+        )
+
+        for i, task in enumerate(tasks):
+            _raise_if_pipeline_stopped(pipeline)
+            acceptance_contract, retry_context = task_contexts[task.id]
+            pipeline.current_task = task.title
+            pipeline.save(update_fields=["current_task"])
+
+            task_completed = False
+            for attempt in range(MAX_RETRIES + 1):
+                _raise_if_pipeline_stopped(pipeline)
+                retry_context["attempt"] = attempt
+                pipeline.append_log(
+                    f"[AI] Using model: {selected_model} | verify task {i + 1}/{len(tasks)} | "
+                    f"attempt {attempt + 1}/{MAX_RETRIES + 1}"
+                )
+                if attempt > 0:
+                    pipeline.append_log(f"\n--- Verify attempt {attempt}/{MAX_RETRIES} ---")
+
+                # Preflight repairs belong to the debugging stage; they are
+                # allowed now that development has finished.
+                diagnostics = _project_preflight(project_files)
+                if diagnostics:
                     pipeline.stage = PipelineRun.Stage.DEBUGGING
                     pipeline.save(update_fields=["stage"])
-                    pipeline.append_log("[Debugger] Repairing developer exception...")
+                    pipeline.append_log(
+                        f"[Preflight] Found {len(diagnostics)} file failure(s) "
+                        f"before verifying '{task.title}'"
+                    )
+                    for diagnostic in diagnostics[:10]:
+                        pipeline.append_log(f"[Preflight] {diagnostic}")
                     try:
-                        _repair_workspace(
+                        repaired = _repair_workspace(
                             task, project, project_files, project_dir, pipeline,
-                            [last_error], selected_model,
+                            diagnostics, selected_model,
+                            acceptance_contract=acceptance_contract,
+                            retry_context=retry_context,
                         )
-                    except Exception as repair_error:
-                        pipeline.append_log(f"[Debugger] Repair error: {repair_error}")
-                    continue
+                        remaining = _project_preflight(project_files)
+                        if repaired and not remaining:
+                            pipeline.append_log("[Preflight] Debugger repaired all detected file failures")
+                        elif remaining:
+                            pipeline.append_log(
+                                f"[Preflight] {len(remaining)} failure(s) remain after repair"
+                            )
+                    except Exception as error:
+                        pipeline.append_log(f"[Preflight] Repair error: {error}")
 
                 # TESTER
                 pipeline.stage = PipelineRun.Stage.TESTING
